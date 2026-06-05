@@ -35,7 +35,7 @@ import (
 // AKS-label zone (e.g. "westus-1") into Location ("westus") and Zones (["1"]),
 // matching what ARM actually returns. This ensures the matcher's ARM→AKS-label
 // conversion (zones.MakeAKSLabelZoneFromVM) is exercised — without it, mocks
-// stored AKS-label format directly in vm.Zones and hid Bug #6.
+// would store AKS-label format directly in vm.Zones and hide the zone-format mismatch.
 //
 // Pass "0" for a regional (non-zonal) VM (no Zones array, Location still set).
 // Pass "" to omit zones entirely (degenerate VM — used in some negative tests).
@@ -321,18 +321,19 @@ func TestAssign_VMsButNoRequests(t *testing.T) {
 	g.Expect(surplus).To(HaveLen(2))
 }
 
-// TestAssign_ZoneFormatConversion_RawARMZoneFromAzure is the regression test for Bug #6.
+// TestAssign_ZoneFormatConversion_RawARMZoneFromAzure is the regression test for the
+// ARM→AKS-label zone format mismatch.
 //
 // Real Azure VM list responses set vm.Zones to numeric ARM-zone strings ("1", "2", "3")
 // and vm.Location to the region (e.g. "southcentralus"). The scheduler populates
 // VMAssignmentRequest.AcceptableZones in AKS-label format ("southcentralus-3").
 //
-// Before the fix: skuAndZone returned the raw "3", which never matched the request's
-// "southcentralus-3" — every Fleet-created VM was routed to surplus and deleted by
-// karpenter's deleteSurplusVMs cleanup, causing every fleet e2e to time out.
+// If skuAndZone returns the raw "3", it never matches the request's "southcentralus-3" —
+// every Fleet-created VM would be routed to surplus and deleted by deleteSurplusVMs,
+// causing every fleet e2e to time out.
 //
 // This test directly constructs the realistic ARM payload (bypassing mkVM) to ensure
-// no future test-helper refactor can re-hide the bug.
+// no future test-helper refactor can re-hide the mismatch.
 func TestAssign_ZoneFormatConversion_RawARMZoneFromAzure(t *testing.T) {
 	g := NewWithT(t)
 
@@ -356,7 +357,7 @@ func TestAssign_ZoneFormatConversion_RawARMZoneFromAzure(t *testing.T) {
 	g.Expect(assigned).To(HaveLen(1), "VM must be assigned, not deleted as surplus")
 	g.Expect(assigned["nc-1"].Zone).To(Equal("southcentralus-3"))
 	g.Expect(unmatched).To(BeEmpty())
-	g.Expect(surplus).To(BeEmpty(), "Bug #6: VM was previously routed to surplus → karpenter deleted it")
+	g.Expect(surplus).To(BeEmpty(), "zone-format mismatch would route the VM to surplus → karpenter would delete it")
 }
 
 // TestAssign_ZoneFormatConversion_RegionalVM verifies that a regional ARM VM

@@ -133,7 +133,7 @@ func popMatch(buckets map[skuZoneKey][]*armcompute.VirtualMachine, req *VMAssign
 //
 // IMPORTANT: ARM returns vm.Zones as numeric strings ("1", "2", "3") and a separate
 // vm.Location. Using vm.Zones[0] directly would never match the request's AKS-label
-// zones — every VM would be routed to surplus and deleted (see Bug #6 in the plan).
+// zones — every VM would be routed to surplus and deleted.
 //
 // Returns ok=false if any required field is missing or zone conversion fails.
 func skuAndZone(vm *armcompute.VirtualMachine) (string, string, bool) {
