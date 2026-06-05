@@ -160,6 +160,13 @@ func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetV
 	)
 	sharedState.SetVMs(vms)
 
+	// Run assignment + tagging + surplus-delete on the executor's ctx, BEFORE
+	// fanning out the state to any FleetMemberPromise. This guarantees:
+	//   (a) all promises see a fully-ready state when their Wait() runs,
+	//   (b) housekeeping survives any single reconcile being cancelled,
+	//   (c) Wait() needs no ctx and no sync.Once.
+	sharedState.runAssignmentAndCleanup(ctx)
+
 	// 7. Distribute shared state to all requests.
 	e.distributeSharedState(batch, sharedState)
 }

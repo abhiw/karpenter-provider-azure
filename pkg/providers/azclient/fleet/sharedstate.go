@@ -74,21 +74,18 @@ func (s *FleetSharedState) SetError(err error) {
 	s.err = err
 }
 
-// ExecuteSharedPoll runs the assignment logic exactly once (via sync.Once).
-// Multiple concurrent callers (from different promise Wait() calls) will block
-// until the first caller completes.
-func (s *FleetSharedState) ExecuteSharedPoll(ctx context.Context) {
-	s.once.Do(func() {
-		s.executePoll(ctx)
-	})
-}
-
-// executePoll performs the actual assignment work:
-// 1. Use injected VMs (executor already polled LRO and listed VMs)
-// 2. Run assignment matching
-// 3. Tag assigned VMs
-// 4. Delete surplus VMs (best-effort)
-func (s *FleetSharedState) executePoll(ctx context.Context) {
+// runAssignmentAndCleanup performs all per-batch housekeeping. Must be called by
+// the executor exactly once, AFTER SetVMs and BEFORE handing the state to any
+// FleetMemberPromise (i.e. before distributeSharedState). Steps:
+//  1. Use injected VMs (executor already polled LRO and listed VMs)
+//  2. Run NodeClaim → VM assignment matching
+//  3. Tag assigned VMs with nodeclaim-name (best-effort)
+//  4. Delete surplus VMs (best-effort)
+//
+// Promises that subsequently call Wait() only read from this state — they never
+// invoke this method. The channel send in distributeSharedState provides the
+// happens-before barrier guaranteeing all writes here are visible to promises.
+func (s *FleetSharedState) runAssignmentAndCleanup(ctx context.Context) {
 	// If executor already set an error (LRO failure), short-circuit.
 	if s.err != nil {
 		return

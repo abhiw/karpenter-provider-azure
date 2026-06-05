@@ -47,10 +47,11 @@ var _ Promise = (*FleetMemberPromise)(nil)
 
 // Wait blocks until the fleet batch completes and a VM is assigned to this NodeClaim.
 // Returns InsufficientCapacityError if no VM was assigned.
+//
+// All SDK work (assignment, tagging, surplus deletion) is performed by the executor
+// before this state is handed to the promise, so Wait() is a pure read — no ctx
+// is required, no sync.Once is needed.
 func (p *FleetMemberPromise) Wait() error {
-	// TODO(fleet-poc-mh-cloudprovider-create): pass real ctx from caller
-	p.sharedState.ExecuteSharedPoll(context.TODO())
-
 	if err := p.sharedState.GetError(); err != nil {
 		return err
 	}

@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -75,12 +74,13 @@ func (m *mockVMAPI) NewListPager(_ string, _ *armcompute.VirtualMachinesClientLi
 
 // --- Tests ---
 
-// TestFleetSharedState_ExecuteOnce verifies sync.Once ensures executePoll runs exactly once
-// even when called concurrently from multiple goroutines.
-func TestFleetSharedState_ExecuteOnce(t *testing.T) {
+// TestFleetSharedState_SingleRunAssignment verifies that runAssignmentAndCleanup
+// produces the expected assignment on a single call. With sync.Once removed,
+// the executor is the single caller — concurrent calls are no longer part of
+// the contract.
+func TestFleetSharedState_SingleRunAssignment(t *testing.T) {
 	g := NewWithT(t)
 
-	var execCount atomic.Int32
 	vmSize := armcompute.VirtualMachineSizeTypes("Standard_D4s_v3")
 	// Realistic ARM payload: numeric zone + region location. The matcher must
 	// convert these to AKS-label format ("westus-1") to match the request.
@@ -102,24 +102,9 @@ func TestFleetSharedState_ExecuteOnce(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	// Wrap to count executions
-	origOnce := &state.once
-	_ = origOnce
+	state.runAssignmentAndCleanup(context.Background())
 
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			state.ExecuteSharedPoll(context.Background())
-			execCount.Add(1)
-		}()
-	}
-	wg.Wait()
-
-	// All 10 goroutines completed, but assignment should show exactly 1 result
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
-	g.Expect(execCount.Load()).To(Equal(int32(10)))
 }
 
 // TestFleetSharedState_AllRequestsAssigned verifies that when VMs match all requests,
@@ -141,7 +126,7 @@ func TestFleetSharedState_AllRequestsAssigned(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
@@ -167,7 +152,7 @@ func TestFleetSharedState_PartialAssignment(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
@@ -191,7 +176,7 @@ func TestFleetSharedState_SurplusVMsDeleted(t *testing.T) {
 		nil, mock, "fleet-test", "rg-test",
 	)
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 
 	g.Expect(mock.deleteCalls).To(HaveLen(1))
 	g.Expect(mock.deleteCalls[0]).To(ContainSubstring("Standard_D8s_v3"))
@@ -213,7 +198,7 @@ func TestFleetSharedState_TaggingCalled(t *testing.T) {
 		nil, mock, "fleet-test", "rg-test",
 	)
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 
 	g.Expect(mock.updateCalls).To(HaveLen(1))
 	g.Expect(mock.updateCalls[0].Tags).To(HaveKey("karpenter.azure.com_nodeclaim-name"))
@@ -237,13 +222,13 @@ func TestFleetSharedState_TagFailureNonFatal(t *testing.T) {
 		nil, mock, "fleet-test", "rg-test",
 	)
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil()) // still assigned despite tag failure
 }
 
-// TestFleetSharedState_LROError verifies that when SetError is called before ExecuteSharedPoll,
+// TestFleetSharedState_LROError verifies that when SetError is called before runAssignmentAndCleanup,
 // GetError returns the error for all promises.
 func TestFleetSharedState_LROError(t *testing.T) {
 	g := NewWithT(t)
@@ -258,7 +243,7 @@ func TestFleetSharedState_LROError(t *testing.T) {
 	)
 	state.SetError(fmt.Errorf("LRO failed: fleet create timeout"))
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(MatchError(ContainSubstring("LRO failed")))
 	g.Expect(state.GetAssignment("nc-1")).To(BeNil())
@@ -272,7 +257,7 @@ func TestFleetSharedState_EmptyBatch(t *testing.T) {
 		nil, nil, nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 
 	// With 0 requests and 0 VMs, no error but "no VMs available" since requests is nil
 	g.Expect(state.GetError()).To(BeNil())
@@ -292,6 +277,6 @@ func TestFleetSharedState_GetAssignment_Unknown(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.ExecuteSharedPoll(context.Background())
+	state.runAssignmentAndCleanup(context.Background())
 	g.Expect(state.GetAssignment("nc-unknown")).To(BeNil())
 }

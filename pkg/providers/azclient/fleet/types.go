@@ -18,7 +18,6 @@ package fleet
 
 import (
 	"context"
-	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -75,13 +74,13 @@ type FleetBatchResponse struct {
 
 // FleetSharedState is shared across all promises in the same batch.
 // It stores the assignment results after the Fleet LRO completes.
-// The executor builds this struct and hands it to all FleetMemberPromises;
-// the first Wait() call triggers ExecuteSharedPoll via sync.Once.
+// The executor builds this struct, then calls runAssignmentAndCleanup() to
+// compute assignments and run tagging + surplus-delete BEFORE handing the
+// state to any FleetMemberPromise. Promises only ever read from this state.
 type FleetSharedState struct {
-	once          sync.Once
-	assignments   map[string]*FleetAssignment // nodeClaimName → assignment
-	surplus       []*armcompute.VirtualMachine
-	err           error
+	assignments map[string]*FleetAssignment // nodeClaimName → assignment
+	surplus     []*armcompute.VirtualMachine
+	err         error
 
 	// Inputs set by executor before handing to promises
 	requests      []*VMAssignmentRequest
