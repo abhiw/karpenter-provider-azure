@@ -34,7 +34,30 @@ const (
 )
 
 // getResourceListQueryBuilder returns a KQL query builder for listing resources with nodepool tags
-// but excluding AKS machine-created resources
+// but excluding AKS machine-created resources.
+//
+// TODO(fleet-arg-exclusion): when running in Fleet mode, newly-created Fleet
+// VMs (and NICs, which inherit the same Fleet tags) pass through a brief
+// window between the Fleet LRO completing and per-VM nodeclaim-name tagging
+// finishing (see pkg/providers/azclient/fleet/sharedstate.go::tagAssignedVMs).
+// During that window the existing nodeclaim instance GC
+// (pkg/controllers/nodeclaim/garbagecollection/instance_garbagecollection.go)
+// can see those resources as orphans because no NodeClaim yet references
+// them, and delete them after its 1-minute cascadeDeletion timer.
+//
+// The fix is to exclude in-flight Fleet resources from this list by adding:
+//
+//	| where not(tags has_cs "karpenter.azure.com_batch-key-hash"
+//	     and not(tags has_cs "karpenter.azure.com_nodeclaim-name"))
+//
+// (equivalently, using fleet.BatchKeyHashTagKey and fleet.NodeClaimNameTagKey
+// constants and kql.Builder.AddString). It applies to both the VM and NIC
+// builders below since both call this function and Fleet VMs/NICs share tags.
+//
+// The batch-key-hash tag is already propagated to Fleet VMs/NICs as of
+// pkg/providers/azclient/fleet/executor.go::executeBatch, so adding the
+// exclusion clause is a single KQL edit with no other coordination needed.
+// Tracked separately from this PR; see the design doc for the follow-up.
 func getResourceListQueryBuilder(rg string, resourceType string) *kql.Builder {
 	return kql.New(`Resources`).
 		AddLiteral(` | where type == `).AddString(resourceType).

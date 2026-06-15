@@ -33,6 +33,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/garbagecollection"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/inplaceupdate"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/fleet"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
@@ -322,6 +323,93 @@ var _ = Describe("Instance Garbage Collection", func() {
 				Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeTrue())
 
 				ExpectNotFound(ctx, env.Client, node)
+			})
+		})
+
+		// Fleet-provisioned VMs carry the same karpenter.sh_nodepool tag as any
+		// other Karpenter-managed VM (Fleet propagates tags from the Fleet body
+		// onto its backing VMSS, which propagates to the individual VMs). They
+		// therefore show up in cloudProvider.List exactly like single-instance
+		// VMs. These tests prove the EXISTING instance GC correctly handles
+		// both Fleet-VM orphan classes without any production change.
+		var _ = Context("Fleet VMs", func() {
+			fleetVM := func(name, fleetName, nodeClaimName string, age time.Duration) *armcompute.VirtualMachine {
+				tags := map[string]*string{
+					launchtemplate.NodePoolTagKey: lo.ToPtr("default"),
+					fleet.FleetNameTagKey:         lo.ToPtr(fleetName),
+					fleet.BatchKeyHashTagKey:      lo.ToPtr("hash1234"),
+				}
+				if nodeClaimName != "" {
+					tags[fleet.NodeClaimNameTagKey] = lo.ToPtr(nodeClaimName)
+				}
+				return test.VirtualMachine(test.VirtualMachineOptions{
+					Name:         name,
+					NodepoolName: "default",
+					Tags:         tags,
+					Properties: &armcompute.VirtualMachineProperties{
+						TimeCreated: lo.ToPtr(time.Now().Add(-age)),
+					},
+				})
+			}
+
+			It("should delete an unassigned fleet VM with no nodeclaim-name tag past the grace period", func() {
+				// Fleet LRO succeeded, but per-VM nodeclaim-name tag was never
+				// stamped (operator crashed mid-assignment). No matching NC in
+				// the cluster either.
+				vm = fleetVM("fleet-vm-unassigned", "fleet-batch-1", "", 10*time.Minute)
+				providerID = utils.VMResourceIDToProviderID(ctx, lo.FromPtr(vm.ID))
+				azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(vm.ID), *vm)
+
+				ExpectSingletonReconciled(ctx, InstanceGCController)
+
+				_, err = cloudProvider.Get(ctx, providerID)
+				Expect(err).To(HaveOccurred())
+				Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeTrue())
+			})
+
+			It("should delete a fleet VM tagged for a NodeClaim that no longer exists past the grace period", func() {
+				// Assignment tag was stamped, then the NodeClaim was deleted
+				// (e.g., user-initiated delete while operator was down).
+				vm = fleetVM("fleet-vm-stale", "fleet-batch-2", "nc-gone", 10*time.Minute)
+				providerID = utils.VMResourceIDToProviderID(ctx, lo.FromPtr(vm.ID))
+				azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(vm.ID), *vm)
+
+				ExpectSingletonReconciled(ctx, InstanceGCController)
+
+				_, err = cloudProvider.Get(ctx, providerID)
+				Expect(err).To(HaveOccurred())
+				Expect(corecloudprovider.IsNodeClaimNotFoundError(err)).To(BeTrue())
+			})
+
+			It("should NOT delete a fleet VM whose NodeClaim exists with a matching providerID", func() {
+				vm = fleetVM("fleet-vm-bound", "fleet-batch-3", "nc-1", 10*time.Minute)
+				providerID = utils.VMResourceIDToProviderID(ctx, lo.FromPtr(vm.ID))
+				azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(vm.ID), *vm)
+
+				nodeClaim := coretest.NodeClaim(karpv1.NodeClaim{
+					Status: karpv1.NodeClaimStatus{ProviderID: providerID},
+				})
+				ExpectApplied(ctx, env.Client, nodeClaim)
+
+				ExpectSingletonReconciled(ctx, InstanceGCController)
+
+				_, err = cloudProvider.Get(ctx, providerID)
+				Expect(err).ToNot(HaveOccurred())
+				ExpectExists(ctx, env.Client, nodeClaim)
+			})
+
+			It("should NOT delete a young unassigned fleet VM within the 5m grace window", func() {
+				// Recently-created fleet VM, no nodeclaim-name tag yet — this
+				// is precisely the in-flight window. The 5m grace must keep
+				// it alive long enough for sharedstate.tagAssignedVMs to run.
+				vm = fleetVM("fleet-vm-young", "fleet-batch-4", "", 30*time.Second)
+				providerID = utils.VMResourceIDToProviderID(ctx, lo.FromPtr(vm.ID))
+				azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(vm.ID), *vm)
+
+				ExpectSingletonReconciled(ctx, InstanceGCController)
+
+				_, err = cloudProvider.Get(ctx, providerID)
+				Expect(err).ToNot(HaveOccurred())
 			})
 		})
 	})

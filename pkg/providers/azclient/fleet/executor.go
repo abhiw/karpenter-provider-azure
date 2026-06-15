@@ -32,11 +32,6 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/batcher"
 )
 
-const (
-	// FleetNameTagKey is applied to all Fleet VMs so the executor can discover them after LRO.
-	FleetNameTagKey = "karpenter.azure.com_fleet-name"
-)
-
 // executor sends batches to the Azure Fleet API.
 // It transforms a pending batch into a Fleet CreateOrUpdate call, waits for
 // the LRO, runs VM assignment, and distributes results back to each request.
@@ -104,6 +99,9 @@ func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetV
 		fleetTags[k] = v
 	}
 	fleetTags[FleetNameTagKey] = lo.ToPtr(name)
+	fleetTags[ManagedByTagKey] = lo.ToPtr(ManagedByTagValue)
+	fleetTags[ClusterNameTagKey] = lo.ToPtr(e.clusterName)
+	fleetTags[BatchKeyHashTagKey] = lo.ToPtr(hash8FromBatchKey(batch.Key))
 
 	fleetBody := BuildFleetBody(
 		fields,
@@ -194,13 +192,20 @@ func (e *executor) distributeSharedState(batch *batcher.Batch[FleetVMProvisionRe
 // the same Fleet resource. This makes BeginCreateOrUpdate idempotent.
 // batchKey format: "<nodepool>/<capacityType>/<hash16>"
 func fleetName(clusterName, batchKey string) string {
-	// Extract last segment (the 16-char hex hash), take first 8 chars.
+	return fmt.Sprintf("fleet-%s-%s", clusterName, hash8FromBatchKey(batchKey))
+}
+
+// hash8FromBatchKey extracts the 8-char hash suffix from a batch key.
+// batchKey format: "<nodepool>/<capacityType>/<hash16>" — we use the last
+// segment's first 8 hex chars. Shared between fleetName (Azure resource name)
+// and BatchKeyHashTagKey value (must match so the two are correlatable).
+func hash8FromBatchKey(batchKey string) string {
 	lastSlash := strings.LastIndex(batchKey, "/")
 	hash := batchKey[lastSlash+1:]
 	if len(hash) > 8 {
 		hash = hash[:8]
 	}
-	return fmt.Sprintf("fleet-%s-%s", clusterName, hash)
+	return hash
 }
 
 // extractBatchKeyFields builds the BatchKeyFields from a FleetVMProvisionRequest.
@@ -225,8 +230,14 @@ func extractBatchKeyFields(req *FleetVMProvisionRequest) BatchKeyFields {
 	}
 }
 
-// listFleetVMs lists all VMs in the resource group that carry the fleet-name tag
-// matching the given name. This discovers VMs created by the Fleet VMSS Flex.
+// listFleetVMs lists all VMs in the resource group that carry the fleet-name
+// tag matching the given name. This discovers VMs created by the Fleet VMSS
+// Flex after the LRO completes (so we can stamp NodeClaim-name tags onto
+// winners). Works because each Flex Fleet member is an independent
+// Microsoft.Compute/virtualMachines resource that NewListPager surfaces.
+//
+// Cost note: NewListPager returns ALL VMs in the resource group; the per-VM
+// tag check is client-side.
 func (e *executor) listFleetVMs(ctx context.Context, name string) ([]*armcompute.VirtualMachine, error) {
 	pager := e.vmClient.NewListPager(e.resourceGroup, nil)
 	var vms []*armcompute.VirtualMachine

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	sdkerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -34,6 +35,7 @@ type FleetMemberPromise struct {
 	nodeClaimName string
 	capacityType  string
 	fleetName     string
+	deleteVMFunc  func(context.Context, string) error
 
 	// Populated after Wait() completes successfully
 	VM           *armcompute.VirtualMachine
@@ -71,21 +73,46 @@ func (p *FleetMemberPromise) Wait() error {
 	return nil
 }
 
+// SetDeleteVMFunc injects the preferred VM delete primitive for Cleanup.
+func (p *FleetMemberPromise) SetDeleteVMFunc(deleteVMFunc func(context.Context, string) error) {
+	p.deleteVMFunc = deleteVMFunc
+}
+
 // Cleanup deletes the assigned VM if one exists. No-op if Wait() wasn't called or no VM was assigned.
 func (p *FleetMemberPromise) Cleanup(ctx context.Context) error {
 	if p.VM == nil || p.VM.Name == nil {
 		return nil
 	}
+	vmName := *p.VM.Name
+	if p.deleteVMFunc != nil {
+		return p.deleteVMFunc(ctx, vmName)
+	}
 	vmClient := p.sharedState.GetVMClient()
 	if vmClient == nil {
 		return nil
 	}
-	poller, err := vmClient.BeginDelete(ctx, p.sharedState.GetResourceGroup(), *p.VM.Name, nil)
+
+	forceDelete := true
+	poller, err := vmClient.BeginDelete(
+		ctx,
+		p.sharedState.GetResourceGroup(),
+		vmName,
+		&armcompute.VirtualMachinesClientBeginDeleteOptions{ForceDeletion: &forceDelete},
+	)
 	if err != nil {
-		return fmt.Errorf("cleanup VM %s: %w", *p.VM.Name, err)
+		if sdkerrors.IsNotFoundErr(err) {
+			return nil
+		}
+		return fmt.Errorf("cleanup VM %s: %w", vmName, err)
 	}
 	_, err = poller.PollUntilDone(ctx, nil)
-	return err
+	if err != nil {
+		if sdkerrors.IsNotFoundErr(err) {
+			return nil
+		}
+		return fmt.Errorf("cleanup VM %s poll: %w", vmName, err)
+	}
+	return nil
 }
 
 // GetInstanceName returns the assigned VM name, or empty string if not yet assigned.

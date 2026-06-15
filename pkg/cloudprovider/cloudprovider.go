@@ -259,6 +259,7 @@ func (c *CloudProvider) createFleetInstance(ctx context.Context, nodeClass *v1be
 	if err != nil {
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating fleet instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
 	}
+	fleetPromise.SetDeleteVMFunc(c.vmInstanceProvider.Delete)
 
 	// FleetMemberPromise.VM is populated lazily inside Wait() — the LRO + VM-to-NodeClaim
 	// assignment must complete first (see fleetpromise.go). Unlike VirtualMachinePromise (where
@@ -506,9 +507,29 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 		return c.aksMachineInstanceProvider.Delete(ctx, aksMachineName)
 	}
 
-	// VM-based node
+	// VM-based node — primary path: derive the VM name from providerID.
 	vmName, err := nodeclaimutils.GetVMName(nodeClaim.Status.ProviderID)
 	if err != nil {
+		// Fallback (Fleet mode only): the NodeClaim has no usable
+		// Status.ProviderID. This is the recovery path for the rare case
+		// where Karpenter crashed (or the context was cancelled) between
+		// the Fleet LRO completing — which already tagged the VM with
+		// nodeclaim-name in sharedstate.tagAssignedVMs — and the cloud-
+		// provider Create call returning the providerID to the NodeClaim.
+		// We can still find the VM by its assignment tag and delete it,
+		// preventing a VM leak.
+		if options.FromContext(ctx).IsFleetMode() {
+			vm, ferr := c.vmInstanceProvider.FindVMByNodeClaimTag(ctx, nodeClaim.Name)
+			if ferr != nil {
+				// NewNodeClaimNotFoundError flows up cleanly through the
+				// termination controller; pass it through unwrapped.
+				if cloudprovider.IsNodeClaimNotFoundError(ferr) {
+					return ferr
+				}
+				return fmt.Errorf("fallback lookup by nodeclaim tag, %w", ferr)
+			}
+			return c.vmInstanceProvider.Delete(ctx, lo.FromPtr(vm.Name))
+		}
 		return fmt.Errorf("getting VM name, %w", err)
 	}
 	return c.vmInstanceProvider.Delete(ctx, vmName)

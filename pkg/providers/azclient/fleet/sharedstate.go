@@ -125,7 +125,7 @@ func (s *FleetSharedState) tagAssignedVMs(ctx context.Context, assignments map[s
 		for k, v := range a.VM.Tags {
 			mergedTags[k] = v
 		}
-		mergedTags["karpenter.azure.com_nodeclaim-name"] = lo.ToPtr(ncName)
+		mergedTags[NodeClaimNameTagKey] = lo.ToPtr(ncName)
 
 		update := armcompute.VirtualMachineUpdate{Tags: mergedTags}
 		poller, err := s.vmClient.BeginUpdate(ctx, s.resourceGroup, *a.VM.Name, update, nil)

@@ -46,6 +46,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/fleet"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/offerings"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/labels"
@@ -157,6 +158,11 @@ type VMProvider interface {
 	GetNic(context.Context, string, string) (*armnetwork.Interface, error)
 	DeleteNic(context.Context, string) error
 	ListNics(context.Context) ([]*armnetwork.Interface, error)
+	// FindVMByNodeClaimTag returns the VM in the resource group that carries
+	// the karpenter.azure.com_nodeclaim-name tag matching nodeClaimName, or
+	// (nil, NewNodeClaimNotFoundError) if none exists. Used by the Fleet-mode
+	// CloudProvider.Delete fallback when nodeClaim.Status.ProviderID is empty.
+	FindVMByNodeClaimTag(ctx context.Context, nodeClaimName string) (*armcompute.VirtualMachine, error)
 }
 
 // assert that DefaultProvider implements Provider interface
@@ -412,6 +418,50 @@ func (p *DefaultVMProvider) ListNics(ctx context.Context) ([]*armnetwork.Interfa
 
 func (p *DefaultVMProvider) DeleteNic(ctx context.Context, nicName string) error {
 	return deleteNicIfExists(ctx, p.azClient.NetworkInterfacesClient(), p.resourceGroup, nicName)
+}
+
+// FindVMByNodeClaimTag scans the resource group for a VM whose
+// karpenter.azure.com_nodeclaim-name tag equals nodeClaimName. Returns the
+// first match. Returns NewNodeClaimNotFoundError when no VM matches.
+//
+// Used by the CloudProvider.Delete tag-based fallback in Fleet mode: when a
+// NodeClaim is deleted before Status.ProviderID is populated (e.g., Karpenter
+// crashed mid-Create), we cannot derive the VM name from the providerID and
+// must locate the VM by its assignment tag instead.
+//
+// Intentionally uses the direct VirtualMachines list pager (NOT ARG): ARG can
+// lag a freshly-tagged VM by several seconds, and the recovery scenario is
+// precisely a recent create. NewListPager returns every VM in the resource
+// group; the per-VM tag check is client-side, so this is O(all VMs in RG)
+// per call. Only invoked from the rare fallback path, so the cost is bounded.
+func (p *DefaultVMProvider) FindVMByNodeClaimTag(ctx context.Context, nodeClaimName string) (*armcompute.VirtualMachine, error) {
+	pager := p.azClient.VirtualMachinesClient().NewListPager(p.resourceGroup, nil)
+	return findVMByTag(ctx, pager, fleet.NodeClaimNameTagKey, nodeClaimName, p.resourceGroup)
+}
+
+// findVMByTag iterates pager and returns the first VM whose tag[tagKey] == tagValue.
+// Extracted so tests can drive a fake pager without standing up an Azure client.
+// Returns NewNodeClaimNotFoundError when no match is found.
+func findVMByTag(
+	ctx context.Context,
+	pager *runtime.Pager[armcompute.VirtualMachinesClientListResponse],
+	tagKey, tagValue, resourceGroup string,
+) (*armcompute.VirtualMachine, error) {
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing VMs in %q: %w", resourceGroup, err)
+		}
+		for _, vm := range page.Value {
+			if vm == nil || vm.Tags == nil {
+				continue
+			}
+			if v, ok := vm.Tags[tagKey]; ok && v != nil && *v == tagValue {
+				return vm, nil
+			}
+		}
+	}
+	return nil, corecloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("no VM tagged with %s=%q in resource group %q", tagKey, tagValue, resourceGroup))
 }
 
 // createAKSIdentifyingExtension attaches a VM extension to identify that this VM participates in an AKS cluster
