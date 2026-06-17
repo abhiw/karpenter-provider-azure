@@ -63,6 +63,13 @@ func NewFleetSharedStateForTest(
 	}
 }
 
+// RunAssignmentForTest exposes runAssignmentAndCleanup to external-package tests
+// (e.g. the instance package) that construct a state via NewFleetSharedStateForTest
+// and need assignments populated before exercising the read-only promise path.
+func (s *FleetSharedState) RunAssignmentForTest(ctx context.Context) {
+	s.runAssignmentAndCleanup(ctx)
+}
+
 // SetVMs allows the executor to inject listed VMs before promises call Wait().
 // This is the production path (vs injectedVMs set at construction for tests).
 func (s *FleetSharedState) SetVMs(vms []*armcompute.VirtualMachine) {

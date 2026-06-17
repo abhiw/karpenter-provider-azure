@@ -17,6 +17,7 @@ limitations under the License.
 package azure
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/samber/lo"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	containerservice "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
@@ -56,6 +58,39 @@ func (env *Environment) EventuallyExpectKarpenterNicsToBeDeleted() {
 		}
 		return true
 	}).WithTimeout(10*time.Minute).WithPolling(10*time.Second).Should(BeTrue(), "Expected all orphan NICs to be deleted")
+}
+
+// EventuallyExpectVMNotFound polls the VM client until the named VM returns 404 or is no longer listed
+// in the node resource group. Used to assert the Azure VM is actually removed (not just the K8s Node).
+func (env *Environment) EventuallyExpectVMNotFound(vmName string, timeout time.Duration) {
+	GinkgoHelper()
+	Eventually(func(g Gomega) {
+		_, err := env.vmClient.Get(env.Context, env.NodeResourceGroup, vmName, nil)
+		g.Expect(err).To(HaveOccurred(), fmt.Sprintf("expected VM %s to be deleted", vmName))
+		var respErr *azcore.ResponseError
+		g.Expect(errors.As(err, &respErr)).To(BeTrue(), fmt.Sprintf("expected azcore.ResponseError, got %T", err))
+		g.Expect(respErr.StatusCode).To(Equal(404), fmt.Sprintf("expected 404 for VM %s, got %d", vmName, respErr.StatusCode))
+	}).WithTimeout(timeout).WithPolling(15 * time.Second).Should(Succeed())
+}
+
+// ExpectRemoveVMTag PATCHes the VM to remove a single tag key. Used by the orphan-VM GC e2e
+// to simulate the "Fleet VM never got its nodeclaim-name tag" state on a real provisioned VM.
+func (env *Environment) ExpectRemoveVMTag(vmName, tagKey string) {
+	GinkgoHelper()
+	vm := env.GetVMByName(vmName)
+	mergedTags := make(map[string]*string, len(vm.Tags))
+	for k, v := range vm.Tags {
+		if k == tagKey {
+			continue
+		}
+		mergedTags[k] = v
+	}
+	// VirtualMachineUpdate.Tags is a full replace, so passing the filtered map drops the key.
+	poller, err := env.vmClient.BeginUpdate(env.Context, env.NodeResourceGroup, vmName,
+		armcompute.VirtualMachineUpdate{Tags: mergedTags}, nil)
+	Expect(err).ToNot(HaveOccurred())
+	_, err = poller.PollUntilDone(env.Context, nil)
+	Expect(err).ToNot(HaveOccurred())
 }
 
 func (env *Environment) ExpectCreatedInterface(networkInterface armnetwork.Interface) {

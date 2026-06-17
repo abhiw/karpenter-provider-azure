@@ -59,6 +59,7 @@ type DefaultFleetProvider struct {
 	allocationStrategyProvider   *allocationstrategy.DefaultProvider
 	loadBalancerProvider         *loadbalancer.Provider
 	networkSecurityGroupProvider *networksecuritygroup.Provider
+	vmProvider                   VMProvider
 	location                     string
 	resourceGroup                string
 	subscriptionID               string
@@ -69,12 +70,15 @@ type DefaultFleetProvider struct {
 // NewFleetProvider creates a new DefaultFleetProvider.
 // maxCandidateSKUs controls how many instance types are included in each Fleet request;
 // values ≤ 0 fall back to the default of 10.
+// vmProvider is plumbed through to each FleetMemberPromise so that Cleanup() routes
+// VM deletion through the same path as user-initiated termination.
 func NewFleetProvider(
 	fleetBatchClient *fleet.Client,
 	launchTemplateProvider *launchtemplate.Provider,
 	allocationStrategyProvider *allocationstrategy.DefaultProvider,
 	loadBalancerProvider *loadbalancer.Provider,
 	networkSecurityGroupProvider *networksecuritygroup.Provider,
+	vmProvider VMProvider,
 	location, resourceGroup, subscriptionID, diskEncryptionSetID string,
 	maxCandidateSKUs int,
 ) *DefaultFleetProvider {
@@ -87,6 +91,7 @@ func NewFleetProvider(
 		allocationStrategyProvider:   allocationStrategyProvider,
 		loadBalancerProvider:         loadBalancerProvider,
 		networkSecurityGroupProvider: networkSecurityGroupProvider,
+		vmProvider:                   vmProvider,
 		location:                     location,
 		resourceGroup:                resourceGroup,
 		subscriptionID:               subscriptionID,
@@ -198,6 +203,7 @@ func (p *DefaultFleetProvider) BeginCreate(
 		nodeClaimName: nodeClaim.Name,
 		capacityType:  capacityType,
 		fleetName:     fleetName,
+		vmProvider:    p.vmProvider,
 	}, resp.Error
 }
 

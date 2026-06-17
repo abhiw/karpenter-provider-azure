@@ -167,7 +167,7 @@ func TestExtractCandidateInfo_DuplicateZonesDeduped(t *testing.T) {
 func TestNewFleetProvider_MaxCandidateSKUsDefault(t *testing.T) {
 	g := NewWithT(t)
 
-	p := NewFleetProvider(nil, nil, nil, nil, nil, "", "", "", "", 0)
+	p := NewFleetProvider(nil, nil, nil, nil, nil, nil, "", "", "", "", 0)
 	g.Expect(p.maxCandidateSKUs).To(Equal(defaultMaxCandidateSKUs))
 }
 
@@ -175,7 +175,7 @@ func TestNewFleetProvider_MaxCandidateSKUsDefault(t *testing.T) {
 func TestNewFleetProvider_MaxCandidateSKUsNegative(t *testing.T) {
 	g := NewWithT(t)
 
-	p := NewFleetProvider(nil, nil, nil, nil, nil, "", "", "", "", -5)
+	p := NewFleetProvider(nil, nil, nil, nil, nil, nil, "", "", "", "", -5)
 	g.Expect(p.maxCandidateSKUs).To(Equal(defaultMaxCandidateSKUs))
 }
 
@@ -183,7 +183,7 @@ func TestNewFleetProvider_MaxCandidateSKUsNegative(t *testing.T) {
 func TestNewFleetProvider_MaxCandidateSKUsCustom(t *testing.T) {
 	g := NewWithT(t)
 
-	p := NewFleetProvider(nil, nil, nil, nil, nil, "", "", "", "", 3)
+	p := NewFleetProvider(nil, nil, nil, nil, nil, nil, "", "", "", "", 3)
 	g.Expect(p.maxCandidateSKUs).To(Equal(3))
 }
 

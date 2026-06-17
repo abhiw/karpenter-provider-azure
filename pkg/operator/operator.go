@@ -302,6 +302,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 			allocationStrategyProvider,
 			loadBalancerProvider,
 			networkSecurityGroupProvider,
+			vmInstanceProvider,
 			azConfig.Location,
 			options.FromContext(ctx).NodeResourceGroup,
 			azConfig.SubscriptionID,

@@ -20,7 +20,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computefleet/armcomputefleet"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computefleet/armcomputefleet/v2"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -124,6 +124,9 @@ func buildFleetProperties(
 		VMSizesProfile: buildVMSizesProfile(fields.CandidateSKUs),
 		ComputeProfile: buildComputeProfile(fields, lbBackendPools, instanceTypes, useSIG, extensions),
 	}
+
+	// Fleet is always created in Launch mode (the only supported Compute Fleet mode here).
+	props.Mode = lo.ToPtr(armcomputefleet.FleetModeLaunch)
 
 	switch fields.CapacityType {
 	case karpv1.CapacityTypeSpot:

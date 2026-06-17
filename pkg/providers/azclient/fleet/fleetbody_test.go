@@ -21,7 +21,7 @@ import (
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computefleet/armcomputefleet"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computefleet/armcomputefleet/v2"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -122,6 +122,21 @@ func TestBuildFleetBody_OnDemandCapacityType(t *testing.T) {
 	require.NotNil(t, fleet.Properties.RegularPriorityProfile)
 	assert.Nil(t, fleet.Properties.SpotPriorityProfile)
 	assert.Equal(t, lo.ToPtr(armcomputefleet.RegularPriorityAllocationStrategyLowestPrice), fleet.Properties.RegularPriorityProfile.AllocationStrategy)
+}
+
+// TestBuildFleetBody_AlwaysLaunchMode verifies that the Fleet body is always built in
+// Launch mode (the only supported Compute Fleet mode here), regardless of capacity type.
+func TestBuildFleetBody_AlwaysLaunchMode(t *testing.T) {
+	for _, capacityType := range []string{"on-demand", "spot"} {
+		fields := defaultFields()
+		fields.CapacityType = capacityType
+
+		fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+		require.NotNil(t, fleet.Properties)
+		require.NotNil(t, fleet.Properties.Mode, "capacityType=%s", capacityType)
+		assert.Equal(t, armcomputefleet.FleetModeLaunch, *fleet.Properties.Mode, "capacityType=%s", capacityType)
+	}
 }
 
 // TestBuildFleetBody_SpotMaxPriceDefault verifies that when spotMaxPrice is nil,

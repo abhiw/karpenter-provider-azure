@@ -85,6 +85,7 @@
         }
       }
     },
+    "mode": "Launch",
     "spotPriorityProfile": {
       "allocationStrategy": "PriceCapacityOptimized",
       "capacity": 5,

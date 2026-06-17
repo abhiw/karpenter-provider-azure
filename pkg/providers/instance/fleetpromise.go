@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/fleet"
+	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
 // FleetMemberPromise implements the Promise interface for Fleet-provisioned VMs.
@@ -34,12 +35,14 @@ type FleetMemberPromise struct {
 	nodeClaimName string
 	capacityType  string
 	fleetName     string
+	vmProvider    VMProvider
 
 	// Populated after Wait() completes successfully
 	VM           *armcompute.VirtualMachine
 	InstanceType *cloudprovider.InstanceType
 	Zone         string
-	ProviderID   string
+	// ProviderID is the canonical NodeClaim ProviderID (azure:// prefixed, lowercase RG).
+	ProviderID string
 }
 
 // Ensure FleetMemberPromise implements Promise.
@@ -66,16 +69,25 @@ func (p *FleetMemberPromise) Wait() error {
 	p.InstanceType = assignment.InstanceType
 	p.Zone = assignment.Zone
 	if p.VM != nil && p.VM.ID != nil {
-		p.ProviderID = *p.VM.ID
+		// Match the canonical NodeClaim ProviderID shape (azure:// prefix, lowercase RG)
+		// so downstream consumers (e.g. CloudProvider.Delete → GetVMName) can parse it.
+		p.ProviderID = utils.VMResourceIDToProviderID(context.TODO(), *p.VM.ID)
 	}
 	return nil
 }
 
 // Cleanup deletes the assigned VM if one exists. No-op if Wait() wasn't called or no VM was assigned.
+// Routes through VMProvider.Delete so it inherits the same in-process dedupe,
+// pre-Get idempotency check, IsVMDeleting short-circuit, and ForceDeletion=true semantics
+// used by user-initiated CloudProvider.Delete.
 func (p *FleetMemberPromise) Cleanup(ctx context.Context) error {
 	if p.VM == nil || p.VM.Name == nil {
 		return nil
 	}
+	if p.vmProvider != nil {
+		return p.vmProvider.Delete(ctx, *p.VM.Name)
+	}
+	// Fallback for paths that did not plumb a VMProvider (e.g. legacy test constructors).
 	vmClient := p.sharedState.GetVMClient()
 	if vmClient == nil {
 		return nil

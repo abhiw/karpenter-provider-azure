@@ -18,6 +18,7 @@ package test
 
 import (
 	"fmt"
+	"time"
 
 	"dario.cat/mergo"
 	"github.com/samber/lo"
@@ -52,6 +53,8 @@ type OptionsFields struct {
 	BatchIdleTimeoutMS             *int
 	BatchMaxTimeoutMS              *int
 	MaxBatchSize                   *int
+	FleetVMGCInterval              *time.Duration
+	FleetVMGCGracePeriod           *time.Duration
 
 	// SIG Flags not required by the self hosted offering
 	UseSIG                  *bool
@@ -96,5 +99,7 @@ func Options(overrides ...OptionsFields) *azoptions.Options {
 		BatchIdleTimeoutMS:             lo.FromPtrOr(options.BatchIdleTimeoutMS, 1000),
 		BatchMaxTimeoutMS:              lo.FromPtrOr(options.BatchMaxTimeoutMS, 5000),
 		MaxBatchSize:                   lo.FromPtrOr(options.MaxBatchSize, 50),
+		FleetVMGCInterval:              lo.FromPtrOr(options.FleetVMGCInterval, 5*time.Minute),
+		FleetVMGCGracePeriod:           lo.FromPtrOr(options.FleetVMGCGracePeriod, 15*time.Minute),
 	}
 }
