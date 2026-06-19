@@ -127,6 +127,9 @@ func buildFleetProperties(
 
 	// Fleet is always created in Launch mode (the only supported Compute Fleet mode here).
 	props.Mode = lo.ToPtr(armcomputefleet.FleetModeLaunch)
+	// Launch mode requires a valid VM name prefix for the VMs it creates.
+	// Must begin and end with a word character (no trailing dash/special chars).
+	props.VMNamePrefix = lo.ToPtr("aks")
 
 	switch fields.CapacityType {
 	case karpv1.CapacityTypeSpot:

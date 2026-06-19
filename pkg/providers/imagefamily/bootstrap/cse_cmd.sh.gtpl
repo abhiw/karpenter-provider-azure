@@ -140,6 +140,23 @@ NEEDS_CGROUPV2="{{.NeedsCgroupV2}}"
 SYSCTL_CONTENT="{{.SysctlContent}}"
 TLS_BOOTSTRAP_TOKEN="{{.TLSBootstrapToken}}"
 KUBELET_FLAGS="{{.KubeletFlags}}"
+# In Fleet Launch mode, the VM resource name (e.g. "aks_1238fb96_0", from vmNamePrefix)
+# contains underscores which are invalid in K8s node names (RFC 1123). The OS hostname
+# (from computerNamePrefix, e.g. "aks-AZNYK9") also differs from the VM name. Without
+# an explicit provider-id, the cloud controller manager (CCM) tries to look up the VM by
+# node name and fails because neither hostname nor sanitized VM name will match.
+# Setting --provider-id directly from IMDS bypasses CCM's name-based VM lookup entirely,
+# allowing the node to be initialized with the correct Azure VM identity. For VMSS-backed
+# nodes this is a no-op since CCM already resolves them, but an explicit provider-id is
+# harmless and removes the dependency on CCM's lookup path.
+IMDS_RESOURCE_ID=$(curl -s -H Metadata:true --max-time 5 \
+  "http://169.254.169.254/metadata/instance/compute/resourceId?api-version=2021-02-01&format=text" 2>/dev/null)
+if [ -n "$IMDS_RESOURCE_ID" ]; then
+  IMDS_RG=$(echo "$IMDS_RESOURCE_ID" | sed -n 's|.*/resourceGroups/\([^/]*\)/.*|\1|p')
+  IMDS_RG_LOWER=$(echo "$IMDS_RG" | tr '[:upper:]' '[:lower:]')
+  PROVIDER_ID="azure://$(echo "$IMDS_RESOURCE_ID" | sed "s|/resourceGroups/$IMDS_RG/|/resourceGroups/$IMDS_RG_LOWER/|")"
+  KUBELET_FLAGS="$KUBELET_FLAGS --provider-id=$PROVIDER_ID"
+fi
 KUBELET_NODE_LABELS="{{.KubeletNodeLabels}}"
 AZURE_ENVIRONMENT_FILEPATH="{{.AzureEnvironmentFilepath}}"
 KUBE_CA_CRT="{{.KubeCACrt}}"
