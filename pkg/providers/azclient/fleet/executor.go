@@ -18,11 +18,16 @@ package fleet
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/go-logr/logr"
 	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -35,11 +40,43 @@ import (
 const (
 	// FleetNameTagKey is applied to all Fleet VMs so the executor can discover them after LRO.
 	FleetNameTagKey = "karpenter.azure.com_fleet-name"
+
+	// MaxFleetCapacity is the maximum number of VMs per single Fleet resource.
+	// Azure Fleet API supports up to 10,000 VMs per fleet, but we use a conservative
+	// limit to avoid excessively large ARM operations. This is hardcoded because it
+	// is an Azure platform constraint, not a user-tunable setting.
+	MaxFleetCapacity = 1000
+
+	// inflightCooldown is how long the inflight entry persists after a successful
+	// Fleet LRO. During this window, new batches for the same batch key receive
+	// ErrFleetCoalesced (converted to ICE), which deletes the duplicate NodeClaims.
+	// This prevents duplicate VM provisioning for the same pods during the gap
+	// between "VMs created" and "nodes registered + pods scheduled" (~1-2 min).
+	// The provisioner will keep recreating NodeClaims (harmless churn) until either:
+	//   - The Fleet's nodes register and pods are scheduled (churn stops), or
+	//   - The cooldown expires and a new Fleet fires for genuinely new demand.
+	inflightCooldown = 1 * time.Minute
 )
+
+// inflightEntry tracks an in-progress Fleet LRO for a batch key.
+// Subsequent batches for the same key wait on `done` and reuse the result
+// instead of creating a duplicate Fleet resource.
+type inflightEntry struct {
+	done chan struct{} // closed when the LRO + assignment completes
+	err  error        // non-nil if the Fleet LRO failed
+}
 
 // executor sends batches to the Azure Fleet API.
 // It transforms a pending batch into a Fleet CreateOrUpdate call, waits for
 // the LRO, runs VM assignment, and distributes results back to each request.
+//
+// Inflight coalescing: if a second batch fires for the same batch key while
+// the first is still running (due to provisioner re-triggers during the LRO),
+// the second batch waits for the first to complete and receives a retryable
+// error instead of creating a duplicate Fleet.
+//
+// Batch splitting: when a single batch exceeds MaxFleetCapacity, it is split
+// into parallel sub-batches, each creating its own Fleet resource.
 type executor struct {
 	fleetClient   FleetAPI
 	vmClient      VMAPI
@@ -47,6 +84,13 @@ type executor struct {
 	clusterName   string
 	resourceGroup string
 	location      string
+
+	// maxFleetCapacity is the max VMs per Fleet resource; batches larger than
+	// this are split. Defaults to MaxFleetCapacity. Exposed as a field only for
+	// unit test overrides.
+	maxFleetCapacity int
+
+	inflight sync.Map // batchKey → *inflightEntry
 }
 
 func newExecutor(
@@ -56,19 +100,185 @@ func newExecutor(
 	clusterName, resourceGroup, location string,
 ) *executor {
 	return &executor{
-		fleetClient:   fleetClient,
-		vmClient:      vmClient,
-		errorHandler:  errorHandler,
-		clusterName:   clusterName,
-		resourceGroup: resourceGroup,
-		location:      location,
+		fleetClient:      fleetClient,
+		vmClient:         vmClient,
+		errorHandler:     errorHandler,
+		clusterName:      clusterName,
+		resourceGroup:    resourceGroup,
+		location:         location,
+		maxFleetCapacity: MaxFleetCapacity,
 	}
 }
 
 // executeBatch is the batcher.ExecuteBatch[FleetVMProvisionRequest, FleetBatchResponse] implementation.
 // It orchestrates: fleet name → body → PUT → LRO poll → VM list → shared state → distribute responses.
+//
+// Inflight coalescing: the batcher groups by key within a single firing, but the
+// provisioner re-triggers every ~10s while pods remain Pending. This creates
+// duplicate batches for the same key across firings. If an LRO is already in
+// progress for this key, we wait for it and return a retryable error rather than
+// creating a second Fleet resource with duplicate VMs.
+//
+// Batch splitting: when a single batch exceeds maxFleetCapacity, it is split
+// into parallel sub-batches, each creating its own Fleet resource.
+//
+// Examples:
+//
+//   10 pods, MaxFleetCapacity=1000:
+//     t=0s:  batcher fires batch (10 reqs) → 10 ≤ 1000 → 1 Fleet PUT (capacity=10)
+//     t=10s: provisioner re-triggers → new batch (10 reqs) for same key
+//            → LoadOrStore finds inflight → waits → retryable error, no duplicate Fleet
+//     t=90s: LRO completes → VMs register as nodes → pods scheduled → no more re-triggers
+//
+//   50,000 pods, MaxFleetCapacity=1000:
+//     t=0s:  batcher accumulates all 50,000 reqs into 1 batch (same key)
+//            → fires when idle/max timeout expires
+//            → executeBatch grabs all 50,000 → doFleetCreate splits into 50 sub-batches
+//            → 50 parallel Fleet PUTs, each with capacity=1000
+//     t=10s: provisioner re-triggers → new batch for same key
+//            → coalesces with inflight → retryable error, no duplicate Fleets
+//     t=90s: all 50 LROs complete → 50,000 VMs register → pods scheduled
 func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse]) {
 	logger := log.FromContext(ctx).WithValues("batchKey", batch.Key, "batchSize", len(batch.Requests))
+
+	// --- Inflight coalescing ---
+	// Try to register as the inflight executor for this batch key.
+	entry := &inflightEntry{done: make(chan struct{})}
+	if existing, loaded := e.inflight.LoadOrStore(batch.Key, entry); loaded {
+		// Another executor is already running for this key — coalesce.
+		inflight := existing.(*inflightEntry)
+		logger.Info("coalescing with in-flight fleet LRO for same batch key, waiting")
+		select {
+		case <-inflight.done:
+		case <-ctx.Done():
+			e.distributeError(batch, fmt.Errorf("context canceled while waiting for in-flight fleet: %w", ctx.Err()))
+			return
+		}
+		// The original LRO completed. Return a retryable error so the lifecycle
+		// controller re-queues. By then, the original batch's VMs will have
+		// registered as nodes and the pods will be scheduled — the provisioner
+		// won't recreate these NodeClaims.
+		// We intentionally do NOT use InsufficientCapacityError here to avoid
+		// poisoning the offering cache.
+		if inflight.err != nil {
+			e.distributeError(batch, fmt.Errorf("coalesced fleet LRO failed: %w", inflight.err))
+		} else {
+			e.distributeError(batch, fmt.Errorf("batch key %s: %w", batch.Key, ErrFleetCoalesced))
+		}
+		return
+	}
+
+	// We are the inflight executor. Signal completion when done.
+	// Cooldown logic based on fulfillment:
+	// - Fully fulfilled (VMs >= requests): cooldown prevents duplicate VMs
+	// - Under-provisioned (VMs < requests): clear immediately for retry
+	// - Failed: clear immediately for retry
+	var fullyFulfilled bool
+	defer func() {
+		close(entry.done)
+		if entry.err != nil || !fullyFulfilled {
+			// Fleet failed or under-provisioned — clear immediately so
+			// unfulfilled NodeClaims can retry with a new Fleet.
+			e.inflight.Delete(batch.Key)
+		} else {
+			// Fully fulfilled — keep entry for cooldown to prevent duplicate
+			// VMs. Provisioner re-triggers during node registration get ICE'd.
+			// Once nodes register and pods are scheduled, churn stops.
+			go func() {
+				time.Sleep(inflightCooldown)
+				e.inflight.Delete(batch.Key)
+			}()
+		}
+	}()
+
+	// --- Normal Fleet creation path ---
+	vmsCreated, vmsRequested, err := e.doFleetCreate(ctx, batch, logger)
+	if err != nil {
+		entry.err = err
+	}
+	fullyFulfilled = err == nil && vmsCreated >= vmsRequested
+}
+
+// doFleetCreate performs the actual Fleet PUT → LRO → VM list → assignment → distribute flow.
+// Returns the number of VMs created and requested, plus an error if the Fleet LRO
+// or VM listing failed. The caller uses vmsCreated vs vmsRequested to decide
+// whether to keep the inflight cooldown (fully fulfilled) or clear immediately
+// (under-provisioned, so new batches for unfulfilled NodeClaims can proceed).
+//
+// If the batch exceeds maxFleetCapacity, it is split into parallel sub-batches,
+// each creating its own Fleet resource with up to maxFleetCapacity VMs.
+func (e *executor) doFleetCreate(ctx context.Context, batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse], logger logr.Logger) (vmsCreated, vmsRequested int, err error) {
+	if len(batch.Requests) > e.maxFleetCapacity {
+		return e.doSplitFleetCreate(ctx, batch, logger)
+	}
+	return e.doSingleFleetCreate(ctx, batch, logger)
+}
+
+// doSplitFleetCreate splits a large batch into sub-batches of maxFleetCapacity
+// and creates each in parallel with its own Fleet resource.
+func (e *executor) doSplitFleetCreate(ctx context.Context, batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse], logger logr.Logger) (totalCreated, totalRequested int, err error) {
+	chunks := splitBatchRequests(batch.Requests, e.maxFleetCapacity)
+	logger.Info("splitting large batch into sub-batches", "totalRequests", len(batch.Requests), "subBatches", len(chunks), "maxFleetCapacity", e.maxFleetCapacity)
+
+	totalRequested = len(batch.Requests)
+
+	type subResult struct {
+		created   int
+		requested int
+		err       error
+	}
+
+	var wg sync.WaitGroup
+	results := make([]subResult, len(chunks))
+
+	for i, chunk := range chunks {
+		wg.Add(1)
+		go func(idx int, requests []*batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse]) {
+			defer wg.Done()
+			subBatch := &batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse]{
+				ID:       fmt.Sprintf("%s-sub%d", batch.ID, idx),
+				Key:      batch.Key,
+				Requests: requests,
+			}
+			subLogger := logger.WithValues("subBatch", idx, "subBatchSize", len(requests))
+			c, r, e := e.doSingleFleetCreate(ctx, subBatch, subLogger)
+			results[idx] = subResult{created: c, requested: r, err: e}
+		}(i, chunk)
+	}
+
+	wg.Wait()
+
+	// Aggregate results across sub-batches.
+	var combined []error
+	for _, r := range results {
+		totalCreated += r.created
+		if r.err != nil {
+			combined = append(combined, r.err)
+		}
+	}
+	if len(combined) > 0 {
+		return totalCreated, totalRequested, fmt.Errorf("fleet sub-batch errors: %v", combined)
+	}
+	return totalCreated, totalRequested, nil
+}
+
+// splitBatchRequests splits a slice of requests into chunks of at most chunkSize.
+func splitBatchRequests[Req, Resp any](requests []*batcher.BatchedRequest[Req, Resp], chunkSize int) [][]*batcher.BatchedRequest[Req, Resp] {
+	var chunks [][]*batcher.BatchedRequest[Req, Resp]
+	for i := 0; i < len(requests); i += chunkSize {
+		end := i + chunkSize
+		if end > len(requests) {
+			end = len(requests)
+		}
+		chunks = append(chunks, requests[i:end])
+	}
+	return chunks
+}
+
+// doSingleFleetCreate creates a single Fleet resource for the batch requests.
+// Returns (vmsCreated, vmsRequested, error) for fulfillment tracking.
+func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse], logger logr.Logger) (int, int, error) {
+	requested := len(batch.Requests)
 
 	// 1. Compute deterministic fleet name from batch key.
 	name := fleetName(e.clusterName, batch.Key)
@@ -129,16 +339,18 @@ func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetV
 	poller, err := e.fleetClient.BeginCreateOrUpdate(ctx, e.resourceGroup, name, *fleetBody, nil)
 	if err != nil {
 		logger.Error(err, "fleet BeginCreateOrUpdate failed")
-		e.distributeError(batch, fmt.Errorf("fleet create: %w", err))
-		return
+		fleetErr := fmt.Errorf("fleet create: %w", err)
+		e.distributeError(batch, fleetErr)
+		return 0, requested, fleetErr
 	}
 
 	// 5. Poll LRO to completion.
 	_, err = poller.PollUntilDone(ctx, nil)
 	if err != nil {
 		logger.Error(err, "fleet LRO poll failed")
-		e.distributeError(batch, fmt.Errorf("fleet LRO: %w", err))
-		return
+		lroErr := fmt.Errorf("fleet LRO: %w", err)
+		e.distributeError(batch, lroErr)
+		return 0, requested, lroErr
 	}
 	logger.Info("fleet LRO completed")
 
@@ -146,8 +358,9 @@ func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetV
 	vms, err := e.listFleetVMs(ctx, name)
 	if err != nil {
 		logger.Error(err, "failed to list fleet VMs")
-		e.distributeError(batch, fmt.Errorf("list fleet VMs: %w", err))
-		return
+		listErr := fmt.Errorf("list fleet VMs: %w", err)
+		e.distributeError(batch, listErr)
+		return 0, requested, listErr
 	}
 	logger.Info("listed fleet VMs", "count", len(vms))
 
@@ -160,15 +373,18 @@ func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetV
 	)
 	sharedState.SetVMs(vms)
 
-	// Run assignment + tagging + surplus-delete on the executor's ctx, BEFORE
-	// fanning out the state to any FleetMemberPromise. This guarantees:
-	//   (a) all promises see a fully-ready state when their Wait() runs,
-	//   (b) housekeeping survives any single reconcile being cancelled,
-	//   (c) Wait() needs no ctx and no sync.Once.
-	sharedState.runAssignmentAndCleanup(ctx)
+	// Run assignment only (fast, in-memory) — determines which VM goes to which NodeClaim.
+	sharedState.runAssignment(ctx)
 
-	// 7. Distribute shared state to all requests.
+	// 7. Distribute shared state to all requests immediately, so promises get
+	// providerIDs without waiting for VM tagging (which is slow, ~30s per VM).
 	e.distributeSharedState(batch, sharedState)
+
+	// 8. Tag VMs and delete surplus in the background. Tagging is best-effort
+	// housekeeping for Fleet VM GC — not on the critical path for node registration.
+	go sharedState.runTaggingAndCleanup(ctx)
+
+	return len(vms), requested, nil
 }
 
 // distributeError sends an error to all requests in the batch.
@@ -189,9 +405,10 @@ func (e *executor) distributeSharedState(batch *batcher.Batch[FleetVMProvisionRe
 	}
 }
 
-// fleetName returns the deterministic fleet name: "fleet-{clusterName}-{hash8}"
-// The name is stable for a given batch key configuration — same config always produces
-// the same Fleet resource. This makes BeginCreateOrUpdate idempotent.
+// fleetName returns a unique fleet name: "fleet-{clusterName}-{hash8}-{rand4}"
+// Each invocation produces a distinct name because Launch-mode Fleets are immutable
+// (cannot be updated after creation). The random suffix ensures no 409 conflicts
+// when the same batch key fires multiple times.
 // batchKey format: "<nodepool>/<capacityType>/<hash16>"
 func fleetName(clusterName, batchKey string) string {
 	// Extract last segment (the 16-char hex hash), take first 8 chars.
@@ -200,7 +417,11 @@ func fleetName(clusterName, batchKey string) string {
 	if len(hash) > 8 {
 		hash = hash[:8]
 	}
-	return fmt.Sprintf("fleet-%s-%s", clusterName, hash)
+	// Append 4 random hex chars to make the name unique per invocation.
+	var randBytes [2]byte
+	_, _ = rand.Read(randBytes[:])
+	suffix := hex.EncodeToString(randBytes[:])
+	return fmt.Sprintf("fleet-%s-%s-%s", clusterName, hash, suffix)
 }
 
 // extractBatchKeyFields builds the BatchKeyFields from a FleetVMProvisionRequest.

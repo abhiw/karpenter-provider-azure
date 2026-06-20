@@ -74,7 +74,7 @@ func (m *mockVMAPI) NewListPager(_ string, _ *armcompute.VirtualMachinesClientLi
 
 // --- Tests ---
 
-// TestFleetSharedState_SingleRunAssignment verifies that runAssignmentAndCleanup
+// TestFleetSharedState_SingleRunAssignment verifies that runAssignment + runTaggingAndCleanup
 // produces the expected assignment on a single call. With sync.Once removed,
 // the executor is the single caller — concurrent calls are no longer part of
 // the contract.
@@ -102,7 +102,8 @@ func TestFleetSharedState_SingleRunAssignment(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
 }
@@ -126,7 +127,8 @@ func TestFleetSharedState_AllRequestsAssigned(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
@@ -152,7 +154,8 @@ func TestFleetSharedState_PartialAssignment(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
@@ -176,7 +179,8 @@ func TestFleetSharedState_SurplusVMsDeleted(t *testing.T) {
 		nil, mock, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(mock.deleteCalls).To(HaveLen(1))
 	g.Expect(mock.deleteCalls[0]).To(ContainSubstring("Standard_D8s_v3"))
@@ -198,7 +202,8 @@ func TestFleetSharedState_TaggingCalled(t *testing.T) {
 		nil, mock, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(mock.updateCalls).To(HaveLen(1))
 	g.Expect(mock.updateCalls[0].Tags).To(HaveKey("karpenter.azure.com_nodeclaim-name"))
@@ -222,13 +227,14 @@ func TestFleetSharedState_TagFailureNonFatal(t *testing.T) {
 		nil, mock, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil()) // still assigned despite tag failure
 }
 
-// TestFleetSharedState_LROError verifies that when SetError is called before runAssignmentAndCleanup,
+// TestFleetSharedState_LROError verifies that when SetError is called before runAssignment + runTaggingAndCleanup,
 // GetError returns the error for all promises.
 func TestFleetSharedState_LROError(t *testing.T) {
 	g := NewWithT(t)
@@ -243,7 +249,8 @@ func TestFleetSharedState_LROError(t *testing.T) {
 	)
 	state.SetError(fmt.Errorf("LRO failed: fleet create timeout"))
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(MatchError(ContainSubstring("LRO failed")))
 	g.Expect(state.GetAssignment("nc-1")).To(BeNil())
@@ -257,7 +264,8 @@ func TestFleetSharedState_EmptyBatch(t *testing.T) {
 		nil, nil, nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 
 	// With 0 requests and 0 VMs, no error but "no VMs available" since requests is nil
 	g.Expect(state.GetError()).To(BeNil())
@@ -277,6 +285,7 @@ func TestFleetSharedState_GetAssignment_Unknown(t *testing.T) {
 		nil, nil, "fleet-test", "rg-test",
 	)
 
-	state.runAssignmentAndCleanup(context.Background())
+	state.runAssignment(context.Background())
+	state.runTaggingAndCleanup(context.Background())
 	g.Expect(state.GetAssignment("nc-unknown")).To(BeNil())
 }

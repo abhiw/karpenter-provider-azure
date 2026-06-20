@@ -18,6 +18,7 @@ package fleet
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -29,6 +30,19 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 )
+
+// ErrFleetCoalesced is returned to coalesced batches (duplicate provisioning
+// due to provisioner re-triggers). Callers should treat this as a signal to
+// delete the duplicate NodeClaim rather than retrying, since the original
+// batch already provisioned VMs for the same pods.
+var ErrFleetCoalesced = errors.New("fleet provisioning coalesced: duplicate NodeClaim from provisioner re-trigger")
+
+// IsFleetCoalescedError returns true if the error (or any wrapped error) is
+// ErrFleetCoalesced. Used by CloudProvider to convert this into an
+// InsufficientCapacityError so the lifecycle controller deletes the NodeClaim.
+func IsFleetCoalescedError(err error) bool {
+	return errors.Is(err, ErrFleetCoalesced)
+}
 
 // FleetAPI abstracts the Azure Compute Fleet SDK client for testability.
 type FleetAPI interface {

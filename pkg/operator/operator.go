@@ -281,6 +281,10 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	var fleetProvider instance.FleetProvider
 	if options.FromContext(ctx).IsFleetMode() {
 		fleetErrorHandler := offerings.NewFleetErrorHandler(unavailableOfferingsCache)
+		// For Fleet mode, the batcher should never fire early due to batch size.
+		// We rely solely on idle/max timeout to collect all requests from a provisioner burst.
+		// The executor handles splitting into sub-fleets if needed (MaxFleetCapacity).
+		fleetBatcherMaxSize := 10000
 		fleetBatchClient := fleet.NewClient(
 			ctx,
 			azClient.FleetsClient(),
@@ -293,7 +297,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 			batcher.Options{
 				IdleTimeout:  time.Duration(options.FromContext(ctx).BatchIdleTimeoutMS) * time.Millisecond,
 				MaxTimeout:   time.Duration(options.FromContext(ctx).BatchMaxTimeoutMS) * time.Millisecond,
-				MaxBatchSize: options.FromContext(ctx).MaxBatchSize,
+				MaxBatchSize: fleetBatcherMaxSize,
 			},
 		)
 		fleetProvider = instance.NewFleetProvider(

@@ -63,11 +63,11 @@ func NewFleetSharedStateForTest(
 	}
 }
 
-// RunAssignmentForTest exposes runAssignmentAndCleanup to external-package tests
+// RunAssignmentForTest exposes runAssignment to external-package tests
 // (e.g. the instance package) that construct a state via NewFleetSharedStateForTest
 // and need assignments populated before exercising the read-only promise path.
 func (s *FleetSharedState) RunAssignmentForTest(ctx context.Context) {
-	s.runAssignmentAndCleanup(ctx)
+	s.runAssignment(ctx)
 }
 
 // SetVMs allows the executor to inject listed VMs before promises call Wait().
@@ -81,18 +81,11 @@ func (s *FleetSharedState) SetError(err error) {
 	s.err = err
 }
 
-// runAssignmentAndCleanup performs all per-batch housekeeping. Must be called by
-// the executor exactly once, AFTER SetVMs and BEFORE handing the state to any
-// FleetMemberPromise (i.e. before distributeSharedState). Steps:
-//  1. Use injected VMs (executor already polled LRO and listed VMs)
-//  2. Run NodeClaim → VM assignment matching
-//  3. Tag assigned VMs with nodeclaim-name (best-effort)
-//  4. Delete surplus VMs (best-effort)
-//
-// Promises that subsequently call Wait() only read from this state — they never
-// invoke this method. The channel send in distributeSharedState provides the
-// happens-before barrier guaranteeing all writes here are visible to promises.
-func (s *FleetSharedState) runAssignmentAndCleanup(ctx context.Context) {
+// runAssignment is called by the executor exactly once, AFTER SetVMs and BEFORE
+// distributeSharedState. It only does the assignment matching (fast, in-memory)
+// so that promises receive providerIDs as quickly as possible.
+// Tagging and surplus cleanup run in the background via runTaggingAndCleanup.
+func (s *FleetSharedState) runAssignment(ctx context.Context) {
 	// If executor already set an error (LRO failure), short-circuit.
 	if s.err != nil {
 		return
@@ -104,16 +97,21 @@ func (s *FleetSharedState) runAssignmentAndCleanup(ctx context.Context) {
 		return
 	}
 
-	// Run assignment.
+	// Run assignment (in-memory, fast).
 	assigned, _, surplus := AssignVMsToNodeClaims(s.requests, vms, s.instanceTypes)
 	s.assignments = assigned
 	s.surplus = surplus
+}
 
-	// Tag assigned VMs with per-NodeClaim identity (best-effort).
-	s.tagAssignedVMs(ctx, assigned)
-
-	// Delete surplus VMs (best-effort, don't fail the batch).
-	s.deleteSurplusVMs(ctx, surplus)
+// runTaggingAndCleanup runs in the background after state has been distributed
+// to promises. It tags assigned VMs with nodeclaim-name and deletes surplus VMs.
+// Both operations are best-effort and not on the critical path for node registration.
+func (s *FleetSharedState) runTaggingAndCleanup(ctx context.Context) {
+	if s.err != nil {
+		return
+	}
+	s.tagAssignedVMs(ctx, s.assignments)
+	s.deleteSurplusVMs(ctx, s.surplus)
 }
 
 // tagAssignedVMs patches each assigned VM with the nodeclaim-name tag.

@@ -93,6 +93,7 @@
       "maintain": false,
       "maxPricePerVM": 0.75
     },
+    "vmNamePrefix": "aks",
     "vmSizesProfile": [
       {
         "name": "Standard_D4s_v3"
