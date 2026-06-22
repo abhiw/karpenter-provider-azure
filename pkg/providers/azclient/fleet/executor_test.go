@@ -220,8 +220,8 @@ func TestExecutor_Coalescing_SecondBatchCoalesces(t *testing.T) {
 
 	// Launch batch 1 (the one that should proceed normally)
 	batch1 := makeBatch(batchKey, "nc-1")
-	// Launch batch 2 (should coalesce)
-	batch2 := makeBatch(batchKey, "nc-2")
+	// Launch batch 2 with SAME name (simulates provisioner re-trigger for same pod)
+	batch2 := makeBatch(batchKey, "nc-1")
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -256,6 +256,108 @@ func TestExecutor_Coalescing_SecondBatchCoalesces(t *testing.T) {
 	// Only 1 Fleet should have been created
 	fleetAPI.mu.Lock()
 	g.Expect(fleetAPI.createCalls).To(Equal(int32(1)), "only 1 Fleet PUT should happen")
+	fleetAPI.mu.Unlock()
+}
+
+// TestExecutor_Coalescing_NewClaimsProceedWhileDuplicatesWait verifies that
+// when a batch contains a mix of duplicate NodeClaim names (already inflight)
+// and genuinely new names, only the duplicates coalesce — the new ones proceed
+// with their own Fleet creation.
+func TestExecutor_Coalescing_NewClaimsProceedWhileDuplicatesWait(t *testing.T) {
+	g := NewWithT(t)
+
+	// Track fleet names created so vmAPI returns VMs with correct tags
+	var createdFleetNames sync.Map
+
+	fleetAPI := &mockFleetAPI{
+		createDelay: 200 * time.Millisecond,
+		onCreateName: func(name string) {
+			createdFleetNames.Store(name, true)
+		},
+	}
+	vmAPI := &mockVMAPIForExecutor{
+		vmsToReturnFunc: func() []*armcompute.VirtualMachine {
+			// Return VMs for each created fleet
+			var vms []*armcompute.VirtualMachine
+			i := 0
+			createdFleetNames.Range(func(key, _ any) bool {
+				name := key.(string)
+				vms = append(vms, &armcompute.VirtualMachine{
+					Name: lo.ToPtr(fmt.Sprintf("aks_abc_%d", i)),
+					Tags: map[string]*string{FleetNameTagKey: lo.ToPtr(name)},
+					Properties: &armcompute.VirtualMachineProperties{
+						HardwareProfile: &armcompute.HardwareProfile{VMSize: lo.ToPtr(armcompute.VirtualMachineSizeTypes("Standard_D2s_v3"))},
+					},
+					Zones: []*string{lo.ToPtr("1")},
+				})
+				i++
+				return true
+			})
+			return vms
+		},
+	}
+
+	exec := &executor{
+		fleetClient:      fleetAPI,
+		vmClient:         vmAPI,
+		clusterName:      "test",
+		resourceGroup:    "rg",
+		location:         "eastus",
+		maxFleetCapacity: 200,
+	}
+
+	batchKey := "default/on-demand/abcdef0123456789"
+
+	// Batch 1: claims nc-1, nc-2, nc-3
+	batch1 := makeBatch(batchKey, "nc-1", "nc-2", "nc-3")
+
+	// Batch 2: nc-1, nc-2 are duplicates (re-triggers), nc-4, nc-5 are new
+	batch2 := makeBatch(batchKey, "nc-1", "nc-2", "nc-4", "nc-5")
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		exec.executeBatch(context.Background(), batch1)
+	}()
+
+	// Small delay to ensure batch1 registers its names first
+	time.Sleep(50 * time.Millisecond)
+
+	go func() {
+		defer wg.Done()
+		exec.executeBatch(context.Background(), batch2)
+	}()
+
+	wg.Wait()
+
+	// Batch 1: all 3 requests should succeed
+	responses1 := collectResponses(batch1)
+	g.Expect(responses1).To(HaveLen(3))
+	for i, r := range responses1 {
+		g.Expect(r.Error).To(BeNil(), "batch1 request %d should succeed", i)
+	}
+
+	// Batch 2: should have 4 responses
+	responses2 := collectResponses(batch2)
+	g.Expect(responses2).To(HaveLen(4))
+
+	// Categorize: duplicates get ErrFleetCoalesced, new ones get SharedState
+	var coalesced, succeeded int
+	for _, r := range responses2 {
+		if r.Error != nil && IsFleetCoalescedError(r.Error) {
+			coalesced++
+		} else if r.Error == nil && r.SharedState != nil {
+			succeeded++
+		}
+	}
+	g.Expect(coalesced).To(Equal(2), "2 duplicate NodeClaims (nc-1, nc-2) should coalesce")
+	g.Expect(succeeded).To(Equal(2), "2 new NodeClaims (nc-4, nc-5) should proceed with new Fleet")
+
+	// 2 Fleet PUTs total: one for batch1, one for the new claims in batch2
+	fleetAPI.mu.Lock()
+	g.Expect(fleetAPI.createCalls).To(Equal(int32(2)), "2 Fleet PUTs: original + new claims")
 	fleetAPI.mu.Unlock()
 }
 
@@ -317,8 +419,8 @@ func TestExecutor_Coalescing_AfterLROCompletes_CooldownBlocksDuplicates(t *testi
 	g.Expect(responses1[0].Error).To(BeNil())
 
 	// After batch1 succeeds with full fulfillment, cooldown is active.
-	// batch2 should be coalesced (prevents duplicate VMs).
-	batch2 := makeBatch(batchKey, "nc-2")
+	// batch2 with SAME name should be coalesced (prevents duplicate VMs).
+	batch2 := makeBatch(batchKey, "nc-1")
 	exec.executeBatch(context.Background(), batch2)
 
 	responses2 := collectResponses(batch2)

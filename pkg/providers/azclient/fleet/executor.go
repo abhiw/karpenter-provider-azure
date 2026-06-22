@@ -55,12 +55,20 @@ const (
 	inflightCooldown = 10 * time.Second
 )
 
-// inflightEntry tracks an in-progress Fleet LRO for a batch key.
-// Subsequent batches for the same key wait on `done` and reuse the result
-// instead of creating a duplicate Fleet resource.
+// inflightGroup tracks all in-progress Fleet LROs for a single batch key.
+// Multiple concurrent Fleet creations can coexist for the same key when new
+// NodeClaims arrive while a prior Fleet is inflight — only re-triggered
+// duplicates (same NodeClaimName) coalesce; genuinely new claims proceed.
+type inflightGroup struct {
+	mu      sync.Mutex
+	entries []*inflightEntry
+}
+
+// inflightEntry tracks a single in-progress Fleet LRO within an inflightGroup.
 type inflightEntry struct {
-	done chan struct{} // closed when the LRO + assignment completes
-	err  error        // non-nil if the Fleet LRO failed
+	done  chan struct{}       // closed when the LRO + assignment completes
+	err   error              // non-nil if the Fleet LRO failed
+	names map[string]struct{} // NodeClaim names served by this Fleet
 }
 
 // executor sends batches to the Azure Fleet API.
@@ -87,14 +95,16 @@ type executor struct {
 	// unit test overrides.
 	maxFleetCapacity int
 
-	inflight sync.Map // batchKey → *inflightEntry
+	inflight sync.Map // batchKey → *inflightGroup
 }
 
 func newExecutor(
 	fleetClient FleetAPI,
 	vmClient VMAPI,
 	errorHandler *offerings.FleetErrorHandler,
-	clusterName, resourceGroup, location string,
+	clusterName,
+	resourceGroup,
+	location string,
 ) *executor {
 	return &executor{
 		fleetClient:      fleetClient,
@@ -110,83 +120,184 @@ func newExecutor(
 // executeBatch is the batcher.ExecuteBatch[FleetVMProvisionRequest, FleetBatchResponse] implementation.
 // It orchestrates: fleet name → body → PUT → LRO poll → VM list → shared state → distribute responses.
 //
-// Inflight coalescing: the batcher groups by key within a single firing, but the
-// provisioner re-triggers every ~10s while pods remain Pending. This creates
-// duplicate batches for the same key across firings. If an LRO is already in
-// progress for this key, we wait for it and return a retryable error rather than
-// creating a second Fleet resource with duplicate VMs.
+// Per-name inflight coalescing: the provisioner re-triggers every ~10s while
+// pods remain Pending, creating duplicate NodeClaims for already-inflight pods.
+// Instead of blocking the entire batch when ANY inflight exists for the same key,
+// we split the incoming batch into:
+//   - duplicates: NodeClaim names already tracked by an inflight entry → wait + ErrFleetCoalesced
+//   - newRequests: genuinely new NodeClaim names → proceed with a fresh Fleet
+//
+// This ensures new pods arriving during an LRO get VMs without waiting for the
+// prior batch to complete.
 //
 // Batch splitting: when a single batch exceeds maxFleetCapacity, it is split
 // into parallel sub-batches, each creating its own Fleet resource.
 //
 // Examples:
 //
-//   10 pods, MaxFleetCapacity=1000:
-//     t=0s:  batcher fires batch (10 reqs) → 10 ≤ 1000 → 1 Fleet PUT (capacity=10)
-//     t=10s: provisioner re-triggers → new batch (10 reqs) for same key
-//            → LoadOrStore finds inflight → waits → retryable error, no duplicate Fleet
-//     t=90s: LRO completes → VMs register as nodes → pods scheduled → no more re-triggers
+//	10 pods at t=0, 15 pods at t=10 (10 re-triggers + 5 new):
+//	  t=0s:  batch (10 reqs) → registers names {nc1..nc10} → 1 Fleet PUT
+//	  t=10s: batch (15 reqs) → split: 10 duplicates coalesce, 5 new proceed → new Fleet PUT
+//	  t=90s: both LROs complete → all 15 VMs register
 //
-//   50,000 pods, MaxFleetCapacity=1000:
-//     t=0s:  batcher accumulates all 50,000 reqs into 1 batch (same key)
-//            → fires when idle/max timeout expires
-//            → executeBatch grabs all 50,000 → doFleetCreate splits into 50 sub-batches
-//            → 50 parallel Fleet PUTs, each with capacity=1000
-//     t=10s: provisioner re-triggers → new batch for same key
-//            → coalesces with inflight → retryable error, no duplicate Fleets
-//     t=90s: all 50 LROs complete → 50,000 VMs register → pods scheduled
+//	50,000 pods, MaxFleetCapacity=1000:
+//	  t=0s:  batch (50,000 reqs) → doFleetCreate splits into 50 sub-batches
+//	         → 50 parallel Fleet PUTs, each with capacity=1000
+//	  t=10s: re-triggers coalesce per-name; any genuinely new claims get a fresh Fleet
 func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse]) {
 	logger := log.FromContext(ctx).WithValues("batchKey", batch.Key, "batchSize", len(batch.Requests))
 
-	// --- Inflight coalescing ---
-	// Try to register as the inflight executor for this batch key.
-	entry := &inflightEntry{done: make(chan struct{})}
-	if existing, loaded := e.inflight.LoadOrStore(batch.Key, entry); loaded {
-		// Another executor is already running for this key — coalesce.
-		inflight := existing.(*inflightEntry)
-		logger.Info("coalescing with in-flight fleet LRO for same batch key, waiting")
-		select {
-		case <-inflight.done:
-		case <-ctx.Done():
-			e.distributeError(batch, fmt.Errorf("context canceled while waiting for in-flight fleet: %w", ctx.Err()))
-			return
-		}
-		// The original LRO completed. Return a retryable error so the lifecycle
-		// controller re-queues. By then, the original batch's VMs will have
-		// registered as nodes and the pods will be scheduled — the provisioner
-		// won't recreate these NodeClaims.
-		// We intentionally do NOT use InsufficientCapacityError here to avoid
-		// poisoning the offering cache.
-		if inflight.err != nil {
-			e.distributeError(batch, fmt.Errorf("coalesced fleet LRO failed: %w", inflight.err))
-		} else {
-			e.distributeError(batch, fmt.Errorf("batch key %s: %w", batch.Key, ErrFleetCoalesced))
-		}
+	// --- Per-name inflight coalescing ---
+	group := e.getOrCreateGroup(batch.Key)
+	duplicates, newRequests := e.splitByInflightNames(group, batch.Requests)
+
+	// Handle duplicates: wait for their respective inflight entries, then return retryable error.
+	if len(duplicates) > 0 {
+		logger.Info("coalescing duplicate NodeClaims with in-flight Fleet LROs",
+			"duplicateCount", len(duplicates), "newCount", len(newRequests))
+		go e.waitAndCoalesceDuplicates(ctx, duplicates, batch.Key)
+	}
+
+	// If no genuinely new requests, we're done.
+	if len(newRequests) == 0 {
 		return
 	}
 
-	// We are the inflight executor. Signal completion when done.
-	// Keep a short cooldown after success to prevent phantom duplicate claims
-	// from triggering new Fleets before nodes register.
+	// Register a new inflight entry for the new requests.
+	names := make(map[string]struct{}, len(newRequests))
+	for _, req := range newRequests {
+		names[req.Payload.NodeClaimName] = struct{}{}
+	}
+	entry := &inflightEntry{
+		done:  make(chan struct{}),
+		names: names,
+	}
+	group.mu.Lock()
+	group.entries = append(group.entries, entry)
+	group.mu.Unlock()
+
+	// Signal completion when done. Apply cooldown to prevent phantom re-triggers.
 	defer func() {
 		close(entry.done)
 		if entry.err != nil {
-			e.inflight.Delete(batch.Key)
+			e.removeEntry(group, entry)
 		} else {
 			go func() {
 				time.Sleep(inflightCooldown)
-				e.inflight.Delete(batch.Key)
+				e.removeEntry(group, entry)
 			}()
 		}
 	}()
 
-	// --- Normal Fleet creation path ---
-	vmsCreated, vmsRequested, err := e.doFleetCreate(ctx, batch, logger)
+	// --- Normal Fleet creation path (only for genuinely new requests) ---
+	newBatch := &batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse]{
+		ID:       batch.ID,
+		Key:      batch.Key,
+		Requests: newRequests,
+	}
+	logger.Info("proceeding with new Fleet creation", "newRequestCount", len(newRequests))
+	_, _, err := e.doFleetCreate(ctx, newBatch, logger)
 	if err != nil {
 		entry.err = err
 	}
-	_ = vmsCreated >= vmsRequested // fulfillment tracked for logging only
 }
+
+// getOrCreateGroup returns the inflightGroup for a batch key, creating one if needed.
+func (e *executor) getOrCreateGroup(batchKey string) *inflightGroup {
+	val, _ := e.inflight.LoadOrStore(batchKey, &inflightGroup{})
+	return val.(*inflightGroup)
+}
+
+// splitByInflightNames partitions requests into duplicates (name already inflight)
+// and new requests (name not seen in any active entry).
+func (e *executor) splitByInflightNames(
+	group *inflightGroup,
+	requests []*batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse],
+) (
+	duplicates []*duplicateRequest,
+	newRequests []*batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse],
+) {
+	group.mu.Lock()
+	defer group.mu.Unlock()
+
+	for _, req := range requests {
+		name := req.Payload.NodeClaimName
+		matched := false
+		for _, entry := range group.entries {
+			if _, exists := entry.names[name]; exists {
+				duplicates = append(duplicates, &duplicateRequest{
+					request: req,
+					entry:   entry,
+				})
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			newRequests = append(newRequests, req)
+		}
+	}
+	return duplicates, newRequests
+}
+
+// duplicateRequest pairs a batched request with the inflight entry it matched.
+type duplicateRequest struct {
+	request *batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse]
+	entry   *inflightEntry
+}
+
+// waitAndCoalesceDuplicates waits for each duplicate's inflight entry to complete,
+// then sends ErrFleetCoalesced (or the inflight error) to the caller.
+func (e *executor) waitAndCoalesceDuplicates(ctx context.Context, duplicates []*duplicateRequest, batchKey string) {
+	for _, dup := range duplicates {
+		select {
+		case <-dup.entry.done:
+		case <-ctx.Done():
+			dup.request.ResponseChan <- &batcher.Response[FleetBatchResponse]{
+				Payload: FleetBatchResponse{Error: fmt.Errorf("context canceled while waiting for in-flight fleet: %w", ctx.Err())},
+			}
+			continue
+		}
+		if dup.entry.err != nil {
+			dup.request.ResponseChan <- &batcher.Response[FleetBatchResponse]{
+				Payload: FleetBatchResponse{Error: fmt.Errorf("coalesced fleet LRO failed: %w", dup.entry.err)},
+			}
+		} else {
+			dup.request.ResponseChan <- &batcher.Response[FleetBatchResponse]{
+				Payload: FleetBatchResponse{Error: fmt.Errorf("batch key %s: %w", batchKey, ErrFleetCoalesced)},
+			}
+		}
+	}
+}
+
+// removeEntry removes a completed entry from the group. If the group is empty,
+// cleans up the sync.Map entry.
+func (e *executor) removeEntry(group *inflightGroup, entry *inflightEntry) {
+	group.mu.Lock()
+	for i, ent := range group.entries {
+		if ent == entry {
+			group.entries = append(group.entries[:i], group.entries[i+1:]...)
+			break
+		}
+	}
+	empty := len(group.entries) == 0
+	group.mu.Unlock()
+
+	// If no more entries for this key, remove the group from the map.
+	// Note: there's a tiny race where a new entry could be added between
+	// the check and the delete, but LoadOrStore in getOrCreateGroup handles
+	// this safely — worst case is a redundant empty group object.
+	if empty {
+		e.inflight.Range(func(key, value any) bool {
+			if value == group {
+				e.inflight.Delete(key)
+				return false
+			}
+			return true
+		})
+	}
+}
+
 
 // doFleetCreate performs the actual Fleet PUT → LRO → VM list → assignment → distribute flow.
 // Returns the number of VMs created and requested, plus an error if the Fleet LRO

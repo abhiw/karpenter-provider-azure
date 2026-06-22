@@ -33,7 +33,8 @@ func NewFleetSharedState(
 	requests []*VMAssignmentRequest,
 	instanceTypes map[string]*cloudprovider.InstanceType,
 	vmClient VMAPI,
-	fleetName, resourceGroup string,
+	fleetName,
+	resourceGroup string,
 ) *FleetSharedState {
 	return &FleetSharedState{
 		requests:      requests,
