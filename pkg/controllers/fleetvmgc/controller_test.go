@@ -90,6 +90,9 @@ func (s *stubVMProvider) DeleteNic(context.Context, string) error {
 func (s *stubVMProvider) ListNics(context.Context) ([]*armnetwork.Interface, error) {
 	return nil, errors.New("not implemented")
 }
+func (s *stubVMProvider) ListFleetVMs(context.Context) ([]*armcompute.VirtualMachine, error) {
+	return nil, nil
+}
 
 const testClusterName = "test-cluster"
 

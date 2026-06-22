@@ -49,13 +49,10 @@ const (
 
 	// inflightCooldown is how long the inflight entry persists after a successful
 	// Fleet LRO. During this window, new batches for the same batch key receive
-	// ErrFleetCoalesced (converted to ICE), which deletes the duplicate NodeClaims.
-	// This prevents duplicate VM provisioning for the same pods during the gap
-	// between "VMs created" and "nodes registered + pods scheduled" (~1-2 min).
-	// The provisioner will keep recreating NodeClaims (harmless churn) until either:
-	//   - The Fleet's nodes register and pods are scheduled (churn stops), or
-	//   - The cooldown expires and a new Fleet fires for genuinely new demand.
-	inflightCooldown = 1 * time.Minute
+	// ErrFleetCoalesced. This prevents duplicate VM provisioning from phantom
+	// NodeClaims the provisioner creates before nodes register. Kept short (15s)
+	// because kubelet registers within seconds of Fleet LRO completing.
+	inflightCooldown = 10 * time.Second
 )
 
 // inflightEntry tracks an in-progress Fleet LRO for a batch key.
@@ -169,21 +166,13 @@ func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetV
 	}
 
 	// We are the inflight executor. Signal completion when done.
-	// Cooldown logic based on fulfillment:
-	// - Fully fulfilled (VMs >= requests): cooldown prevents duplicate VMs
-	// - Under-provisioned (VMs < requests): clear immediately for retry
-	// - Failed: clear immediately for retry
-	var fullyFulfilled bool
+	// Keep a short cooldown after success to prevent phantom duplicate claims
+	// from triggering new Fleets before nodes register.
 	defer func() {
 		close(entry.done)
-		if entry.err != nil || !fullyFulfilled {
-			// Fleet failed or under-provisioned — clear immediately so
-			// unfulfilled NodeClaims can retry with a new Fleet.
+		if entry.err != nil {
 			e.inflight.Delete(batch.Key)
 		} else {
-			// Fully fulfilled — keep entry for cooldown to prevent duplicate
-			// VMs. Provisioner re-triggers during node registration get ICE'd.
-			// Once nodes register and pods are scheduled, churn stops.
 			go func() {
 				time.Sleep(inflightCooldown)
 				e.inflight.Delete(batch.Key)
@@ -196,7 +185,7 @@ func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetV
 	if err != nil {
 		entry.err = err
 	}
-	fullyFulfilled = err == nil && vmsCreated >= vmsRequested
+	_ = vmsCreated >= vmsRequested // fulfillment tracked for logging only
 }
 
 // doFleetCreate performs the actual Fleet PUT → LRO → VM list → assignment → distribute flow.

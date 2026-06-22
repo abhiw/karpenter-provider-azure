@@ -420,7 +420,7 @@ func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 		nodeClaims = append(nodeClaims, nodeClaim)
 	}
 
-	// List VM-based nodes
+	// List VM-based nodes (non-fleet)
 	vmInstances, err := c.vmInstanceProvider.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing VM instances, %w", err)
@@ -434,6 +434,26 @@ func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 		nodeClaim, err := c.vmInstanceToNodeClaim(ctx, instance, instanceType)
 		if err != nil {
 			return nil, fmt.Errorf("converting VM instance to node claim, %w", err)
+		}
+
+		nodeClaims = append(nodeClaims, nodeClaim)
+	}
+
+	// List Fleet-provisioned VMs separately so the upstream nodeclaim GC controller
+	// can see them and won't delete their NodeClaims thinking the instance is gone.
+	fleetVMInstances, err := c.vmInstanceProvider.ListFleetVMs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing fleet VM instances, %w", err)
+	}
+
+	for _, instance := range fleetVMInstances {
+		instanceType, err := c.resolveInstanceTypeFromVMInstance(ctx, instance)
+		if err != nil {
+			return nil, fmt.Errorf("resolving instance type for fleet VM instance, %w", err)
+		}
+		nodeClaim, err := c.vmInstanceToNodeClaim(ctx, instance, instanceType)
+		if err != nil {
+			return nil, fmt.Errorf("converting fleet VM instance to node claim, %w", err)
 		}
 
 		nodeClaims = append(nodeClaims, nodeClaim)

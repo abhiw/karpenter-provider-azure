@@ -35,7 +35,9 @@ const (
 )
 
 // getResourceListQueryBuilder returns a KQL query builder for listing resources with nodepool tags
-// but excluding AKS machine-created resources and Fleet-provisioned resources
+// but excluding AKS machine-created resources and Fleet-provisioned resources.
+// Fleet VMs are excluded here to prevent the instance GC from deleting them during LRO.
+// The CloudProvider.List() separately includes Fleet VMs for nodeclaim GC visibility.
 func getResourceListQueryBuilder(rg string, resourceType string) *kql.Builder {
 	return kql.New(`Resources`).
 		AddLiteral(` | where type == `).AddString(resourceType).
@@ -48,6 +50,17 @@ func getResourceListQueryBuilder(rg string, resourceType string) *kql.Builder {
 // GetVMListQueryBuilder returns a KQL query builder for listing VMs with nodepool tags
 func GetVMListQueryBuilder(rg string) *kql.Builder {
 	return getResourceListQueryBuilder(rg, vmResourceType)
+}
+
+// GetFleetVMListQueryBuilder returns a KQL query builder for listing Fleet-provisioned VMs.
+// This is used by CloudProvider.List() to make Fleet VMs visible to the upstream
+// nodeclaim GC controller, preventing it from deleting Fleet NodeClaims.
+func GetFleetVMListQueryBuilder(rg string) *kql.Builder {
+	return kql.New(`Resources`).
+		AddLiteral(` | where type == `).AddString(vmResourceType).
+		AddLiteral(` | where resourceGroup == `).AddString(strings.ToLower(rg)).
+		AddLiteral(` | where tags has_cs `).AddString(launchtemplate.NodePoolTagKey).
+		AddLiteral(` | where tags has_cs `).AddString(fleet.FleetNameTagKey)
 }
 
 // GetNICListQueryBuilder returns a KQL query builder for listing NICs with nodepool tags

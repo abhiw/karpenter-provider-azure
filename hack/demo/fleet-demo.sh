@@ -17,7 +17,7 @@ export AZURE_NODE_RESOURCE_GROUP="${AZURE_NODE_RESOURCE_GROUP:-MC_awarhekar-aks-
 export KARPENTER_MSI_NAME="${KARPENTER_MSI_NAME:-karpentermsi}"
 export KARPENTER_SA_NAME="${KARPENTER_SA_NAME:-karpenter-sa}"
 export PROVISION_MODE="fleet"
-export DEMO_REPLICAS="${DEMO_REPLICAS:-60}"
+export DEMO_REPLICAS="${DEMO_REPLICAS:-100}"
 
 # Build settings (WSL)
 export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$PATH"
@@ -294,7 +294,7 @@ spec:
     consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: Never
     budgets:
-      - nodes: "100%"
+      - nodes: "0"
   limits:
     cpu: "1000"
     memory: 2000Gi
@@ -399,8 +399,8 @@ EOF
         WAVE=$((WAVE + 1))
 
         if [[ "$TOTAL_DEPLOYED" -lt "$DEMO_REPLICAS" ]]; then
-            # Random delay: 8-15 seconds (exceeds 5s maxTimeout → forces new batch)
-            DELAY=$(( (RANDOM % 8) + 8 ))
+            # Random delay: 3-10 seconds between waves
+            DELAY=$(( (RANDOM % 8) + 3 ))
             wait_msg "    Waiting ${DELAY}s before next wave..."
             sleep "$DELAY"
         fi
@@ -484,9 +484,18 @@ EOF
                 echo "    pool=fleet-${P}: NodeClaims=${P_CLAIMS} | Nodes=${P_TOTAL} | Ready=${P_READY}"
             fi
         done
-        echo "  ── Total: NodeClaims=${NODECLAIM_COUNT} | Nodes=${NODE_COUNT} | Ready=${READY_COUNT}/${DEMO_REPLICAS} ──"
+        # Show fleet resources
+        FLEET_NAMES=$(az rest --method GET \
+            --url "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_NODE_RESOURCE_GROUP}/providers/Microsoft.AzureFleet/fleets?api-version=2024-11-01" \
+            --query "value[].name" -o tsv 2>/dev/null || echo "")
+        FLEET_CT=$(echo "$FLEET_NAMES" | grep -c . 2>/dev/null || echo 0)
+        if [[ "$FLEET_CT" -gt 0 ]]; then
+            echo "    ── Fleets (${FLEET_CT}) ──"
+            echo "$FLEET_NAMES" | while read -r fn; do echo "      $fn"; done
+        fi
 
         if [[ "$READY_COUNT" -ge "$DEMO_REPLICAS" ]]; then
+            echo "  ── Ready=${READY_COUNT}/${DEMO_REPLICAS} ──────────────────────────"
             echo ""
             break
         fi
@@ -513,6 +522,22 @@ EOF
     echo "  - All nodes joined:          ${ALL_NODES_JOINED_TIME}s"
     echo "  - First node Ready:          ${FIRST_READY_TIME}s"
     echo "  - All nodes Ready:           ${ALL_READY_TIME}s"
+
+    # Fleet summary
+    echo ""
+    info "Fleet Resources Created:"
+    FLEETS_JSON=$(az rest --method GET \
+        --url "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_NODE_RESOURCE_GROUP}/providers/Microsoft.AzureFleet/fleets?api-version=2024-11-01" \
+        2>/dev/null || echo '{"value":[]}')
+    FLEET_COUNT=$(echo "$FLEETS_JSON" | jq '.value | length')
+    echo "  Total Fleets: $FLEET_COUNT"
+    echo "$FLEETS_JSON" | jq -r '.value[] | "  - \(.name) | VMs: \(.properties.targetCapacity // "N/A") | State: \(.properties.provisioningState // "N/A")"' 2>/dev/null
+    echo ""
+
+    info "Fleet LRO log (from controller):"
+    kubectl -n kube-system logs deploy/karpenter --tail=5000 2>/dev/null | \
+        grep -E "fleet LRO completed|listed fleet VMs|coalescing" | sed 's/^/  /' | tail -20
+    echo ""
 
     # Show results
     echo ""

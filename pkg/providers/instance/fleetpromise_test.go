@@ -68,6 +68,9 @@ func (s *promiseStubVMProvider) DeleteNic(context.Context, string) error { retur
 func (s *promiseStubVMProvider) ListNics(context.Context) ([]*armnetwork.Interface, error) {
 	return nil, nil
 }
+func (s *promiseStubVMProvider) ListFleetVMs(context.Context) ([]*armcompute.VirtualMachine, error) {
+	return nil, nil
+}
 
 // makeAssignedVM constructs an armcompute.VirtualMachine that looks like one
 // returned by the Fleet executor (ID has uppercase RG so we can verify the

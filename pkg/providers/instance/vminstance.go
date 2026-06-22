@@ -152,6 +152,7 @@ type VMProvider interface {
 	BeginCreate(context.Context, *v1beta1.AKSNodeClass, *karpv1.NodeClaim, []*corecloudprovider.InstanceType) (*VirtualMachinePromise, error)
 	Get(context.Context, string) (*armcompute.VirtualMachine, error)
 	List(context.Context) ([]*armcompute.VirtualMachine, error)
+	ListFleetVMs(context.Context) ([]*armcompute.VirtualMachine, error)
 	Delete(context.Context, string) error
 	Update(context.Context, string, armcompute.VirtualMachineUpdate) error
 	GetNic(context.Context, string, string) (*armnetwork.Interface, error)
@@ -177,9 +178,9 @@ type DefaultVMProvider struct {
 	errorHandling                *offerings.ResponseErrorHandler
 	env                          *auth.Environment
 
-	vmListQuery, nicListQuery string
-	deletingVMs               sets.Set[string] // tracks in-flight delete operations by VM name
-	deletingVMsMu             sync.RWMutex
+	vmListQuery, nicListQuery, fleetVMListQuery string
+	deletingVMs                                  sets.Set[string] // tracks in-flight delete operations by VM name
+	deletingVMsMu                                sync.RWMutex
 }
 
 func NewDefaultVMProvider(
@@ -211,8 +212,9 @@ func NewDefaultVMProvider(
 		diskEncryptionSetID:          diskEncryptionSetID,
 		env:                          env,
 
-		vmListQuery:  GetVMListQueryBuilder(resourceGroup).String(),
-		nicListQuery: GetNICListQueryBuilder(resourceGroup).String(),
+		vmListQuery:      GetVMListQueryBuilder(resourceGroup).String(),
+		nicListQuery:     GetNICListQueryBuilder(resourceGroup).String(),
+		fleetVMListQuery: GetFleetVMListQueryBuilder(resourceGroup).String(),
 
 		errorHandling: offerings.NewResponseErrorHandler(offeringsCache),
 		deletingVMs:   sets.New[string](),
@@ -342,6 +344,27 @@ func (p *DefaultVMProvider) List(ctx context.Context) ([]*armcompute.VirtualMach
 	data, err := GetResourceData(ctx, client, *req)
 	if err != nil {
 		return nil, fmt.Errorf("querying azure resource graph, %w", err)
+	}
+	var vmList []*armcompute.VirtualMachine
+	for i := range data {
+		vm, err := createVMFromQueryResponseData(data[i])
+		if err != nil {
+			return nil, fmt.Errorf("creating VM object from query response data, %w", err)
+		}
+		vmList = append(vmList, vm)
+	}
+	return vmList, nil
+}
+
+// ListFleetVMs returns Fleet-provisioned VMs via ARG. These are excluded from List()
+// to prevent instance GC from interfering with Fleet LROs, but must be visible to
+// the upstream nodeclaim GC controller to prevent it from deleting Fleet NodeClaims.
+func (p *DefaultVMProvider) ListFleetVMs(ctx context.Context) ([]*armcompute.VirtualMachine, error) {
+	req := NewQueryRequest(&(p.subscriptionID), p.fleetVMListQuery)
+	client := p.azClient.AzureResourceGraphClient()
+	data, err := GetResourceData(ctx, client, *req)
+	if err != nil {
+		return nil, fmt.Errorf("querying azure resource graph for fleet VMs, %w", err)
 	}
 	var vmList []*armcompute.VirtualMachine
 	for i := range data {
