@@ -133,6 +133,21 @@ type AKSNodeClassSpec struct {
 	// https://learn.microsoft.com/en-us/azure/aks/custom-node-configuration
 	// +optional
 	LinuxOSConfig *LinuxOSConfiguration `json:"linuxOSConfig,omitempty"`
+	// interconnectBlockID is the full ARM resource ID of the InterconnectBlock to associate with
+	// provisioned Fleet resources. Applies only to Fleet-mode provisioning.
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectBlocks\/[^\/]+$`
+	// +optional
+	InterconnectBlockID *string `json:"interconnectBlockID,omitempty"`
+	// interconnectGroupID is the full ARM resource ID of the InterconnectGroup to associate with
+	// provisioned Fleet resources. Applies only to Fleet-mode provisioning.
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectGroups\/[^\/]+$`
+	// +optional
+	InterconnectGroupID *string `json:"interconnectGroupID,omitempty"`
+	// interconnectSubgroupID is the full ARM resource ID of the InterconnectGroup subgroup to
+	// associate with provisioned Fleet resources. Applies only to Fleet-mode provisioning.
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectGroups\/[^\/]+\/subgroups\/[^\/]+$`
+	// +optional
+	InterconnectSubgroupID *string `json:"interconnectSubgroupID,omitempty"`
 }
 
 // TODO: Add link for the aka.ms/nap/aksnodeclass-enable-host-encryption docs

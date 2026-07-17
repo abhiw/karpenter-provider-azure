@@ -21,16 +21,20 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	armcomputefleet "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computefleet/armcomputefleet/v2"
 	"github.com/go-logr/logr"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/offerings"
@@ -47,38 +51,26 @@ const (
 	// is an Azure platform constraint, not a user-tunable setting.
 	MaxFleetCapacity = 1000
 
-	// inflightCooldown is how long the inflight entry persists after a successful
-	// Fleet LRO. During this window, new batches for the same batch key receive
-	// ErrFleetCoalesced. This prevents duplicate VM provisioning from phantom
-	// NodeClaims the provisioner creates before nodes register. Kept short (15s)
-	// because kubelet registers within seconds of Fleet LRO completing.
-	inflightCooldown = 10 * time.Second
+	// vmVisibilityPollInterval is how often we re-poll the standalone armcompute
+	// VirtualMachines GET API while waiting for a Fleet-created VM to become visible there.
+	// DefaultVMVisibilityPollInterval is how often we re-poll the standalone armcompute
+	// VirtualMachines GET API while waiting for a Fleet-created VM to become visible there.
+	// Fleet's ListVirtualMachines API can report a VM (e.g. OperationStatus=Launching)
+	// before the standalone VM GET API can find it, due to a brief ARM propagation lag.
+	DefaultVMVisibilityPollInterval = 2 * time.Second
+
+	// DefaultVMVisibilityMaxWait bounds how long we wait for a single VM to become visible
+	// via GET before giving up on it. Without this bound, a VM that never resolves (e.g. it
+	// was actually never created) would hang the batch forever, since the executeBatch
+	// context has no deadline of its own. If we give up, that VM is simply excluded from
+	// this batch's assignment; it will still be tagged/reclaimed by later passes if it
+	// eventually appears, or reclaimed by GC as a surplus/unassigned instance.
+	DefaultVMVisibilityMaxWait = 60 * time.Second
 )
-
-// inflightGroup tracks all in-progress Fleet LROs for a single batch key.
-// Multiple concurrent Fleet creations can coexist for the same key when new
-// NodeClaims arrive while a prior Fleet is inflight — only re-triggered
-// duplicates (same NodeClaimName) coalesce; genuinely new claims proceed.
-type inflightGroup struct {
-	mu      sync.Mutex
-	entries []*inflightEntry
-}
-
-// inflightEntry tracks a single in-progress Fleet LRO within an inflightGroup.
-type inflightEntry struct {
-	done  chan struct{}       // closed when the LRO + assignment completes
-	err   error              // non-nil if the Fleet LRO failed
-	names map[string]struct{} // NodeClaim names served by this Fleet
-}
 
 // executor sends batches to the Azure Fleet API.
 // It transforms a pending batch into a Fleet CreateOrUpdate call, waits for
 // the LRO, runs VM assignment, and distributes results back to each request.
-//
-// Inflight coalescing: if a second batch fires for the same batch key while
-// the first is still running (due to provisioner re-triggers during the LRO),
-// the second batch waits for the first to complete and receives a retryable
-// error instead of creating a duplicate Fleet.
 //
 // Batch splitting: when a single batch exceeds MaxFleetCapacity, it is split
 // into parallel sub-batches, each creating its own Fleet resource.
@@ -95,7 +87,11 @@ type executor struct {
 	// unit test overrides.
 	maxFleetCapacity int
 
-	inflight sync.Map // batchKey → *inflightGroup
+	// vmVisibilityPollInterval and vmVisibilityMaxWait control getVMWaitingForVisibility's
+	// retry-on-404 loop. Default to DefaultVMVisibilityPollInterval/DefaultVMVisibilityMaxWait;
+	// exposed as fields only for unit test overrides (so tests don't take real wall-clock time).
+	vmVisibilityPollInterval time.Duration
+	vmVisibilityMaxWait      time.Duration
 }
 
 func newExecutor(
@@ -107,199 +103,30 @@ func newExecutor(
 	location string,
 ) *executor {
 	return &executor{
-		fleetClient:      fleetClient,
-		vmClient:         vmClient,
-		errorHandler:     errorHandler,
-		clusterName:      clusterName,
-		resourceGroup:    resourceGroup,
-		location:         location,
-		maxFleetCapacity: MaxFleetCapacity,
+		fleetClient:              fleetClient,
+		vmClient:                 vmClient,
+		errorHandler:             errorHandler,
+		clusterName:              clusterName,
+		resourceGroup:            resourceGroup,
+		location:                 location,
+		maxFleetCapacity:         MaxFleetCapacity,
+		vmVisibilityPollInterval: DefaultVMVisibilityPollInterval,
+		vmVisibilityMaxWait:      DefaultVMVisibilityMaxWait,
 	}
 }
 
 // executeBatch is the batcher.ExecuteBatch[FleetVMProvisionRequest, FleetBatchResponse] implementation.
-// It orchestrates: fleet name → body → PUT → LRO poll → VM list → shared state → distribute responses.
-//
-// Per-name inflight coalescing: the provisioner re-triggers every ~10s while
-// pods remain Pending, creating duplicate NodeClaims for already-inflight pods.
-// Instead of blocking the entire batch when ANY inflight exists for the same key,
-// we split the incoming batch into:
-//   - duplicates: NodeClaim names already tracked by an inflight entry → wait + ErrFleetCoalesced
-//   - newRequests: genuinely new NodeClaim names → proceed with a fresh Fleet
-//
-// This ensures new pods arriving during an LRO get VMs without waiting for the
-// prior batch to complete.
+// It orchestrates: fleet name -> body -> PUT -> VM list -> shared state -> distribute responses.
 //
 // Batch splitting: when a single batch exceeds maxFleetCapacity, it is split
 // into parallel sub-batches, each creating its own Fleet resource.
-//
-// Examples:
-//
-//	10 pods at t=0, 15 pods at t=10 (10 re-triggers + 5 new):
-//	  t=0s:  batch (10 reqs) → registers names {nc1..nc10} → 1 Fleet PUT
-//	  t=10s: batch (15 reqs) → split: 10 duplicates coalesce, 5 new proceed → new Fleet PUT
-//	  t=90s: both LROs complete → all 15 VMs register
-//
-//	50,000 pods, MaxFleetCapacity=1000:
-//	  t=0s:  batch (50,000 reqs) → doFleetCreate splits into 50 sub-batches
-//	         → 50 parallel Fleet PUTs, each with capacity=1000
-//	  t=10s: re-triggers coalesce per-name; any genuinely new claims get a fresh Fleet
 func (e *executor) executeBatch(ctx context.Context, batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse]) {
 	logger := log.FromContext(ctx).WithValues("batchKey", batch.Key, "batchSize", len(batch.Requests))
-
-	// --- Per-name inflight coalescing ---
-	group := e.getOrCreateGroup(batch.Key)
-	duplicates, newRequests := e.splitByInflightNames(group, batch.Requests)
-
-	// Handle duplicates: wait for their respective inflight entries, then return retryable error.
-	if len(duplicates) > 0 {
-		logger.Info("coalescing duplicate NodeClaims with in-flight Fleet LROs",
-			"duplicateCount", len(duplicates), "newCount", len(newRequests))
-		go e.waitAndCoalesceDuplicates(ctx, duplicates, batch.Key)
-	}
-
-	// If no genuinely new requests, we're done.
-	if len(newRequests) == 0 {
-		return
-	}
-
-	// Register a new inflight entry for the new requests.
-	names := make(map[string]struct{}, len(newRequests))
-	for _, req := range newRequests {
-		names[req.Payload.NodeClaimName] = struct{}{}
-	}
-	entry := &inflightEntry{
-		done:  make(chan struct{}),
-		names: names,
-	}
-	group.mu.Lock()
-	group.entries = append(group.entries, entry)
-	group.mu.Unlock()
-
-	// Signal completion when done. Apply cooldown to prevent phantom re-triggers.
-	defer func() {
-		close(entry.done)
-		if entry.err != nil {
-			e.removeEntry(group, entry)
-		} else {
-			go func() {
-				time.Sleep(inflightCooldown)
-				e.removeEntry(group, entry)
-			}()
-		}
-	}()
-
-	// --- Normal Fleet creation path (only for genuinely new requests) ---
-	newBatch := &batcher.Batch[FleetVMProvisionRequest, FleetBatchResponse]{
-		ID:       batch.ID,
-		Key:      batch.Key,
-		Requests: newRequests,
-	}
-	logger.Info("proceeding with new Fleet creation", "newRequestCount", len(newRequests))
-	_, _, err := e.doFleetCreate(ctx, newBatch, logger)
-	if err != nil {
-		entry.err = err
-	}
+	logger.Info("proceeding with Fleet creation", "requestCount", len(batch.Requests))
+	e.doFleetCreate(ctx, batch, logger)
 }
 
-// getOrCreateGroup returns the inflightGroup for a batch key, creating one if needed.
-func (e *executor) getOrCreateGroup(batchKey string) *inflightGroup {
-	val, _ := e.inflight.LoadOrStore(batchKey, &inflightGroup{})
-	return val.(*inflightGroup)
-}
-
-// splitByInflightNames partitions requests into duplicates (name already inflight)
-// and new requests (name not seen in any active entry).
-func (e *executor) splitByInflightNames(
-	group *inflightGroup,
-	requests []*batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse],
-) (
-	duplicates []*duplicateRequest,
-	newRequests []*batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse],
-) {
-	group.mu.Lock()
-	defer group.mu.Unlock()
-
-	for _, req := range requests {
-		name := req.Payload.NodeClaimName
-		matched := false
-		for _, entry := range group.entries {
-			if _, exists := entry.names[name]; exists {
-				duplicates = append(duplicates, &duplicateRequest{
-					request: req,
-					entry:   entry,
-				})
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			newRequests = append(newRequests, req)
-		}
-	}
-	return duplicates, newRequests
-}
-
-// duplicateRequest pairs a batched request with the inflight entry it matched.
-type duplicateRequest struct {
-	request *batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse]
-	entry   *inflightEntry
-}
-
-// waitAndCoalesceDuplicates waits for each duplicate's inflight entry to complete,
-// then sends ErrFleetCoalesced (or the inflight error) to the caller.
-func (e *executor) waitAndCoalesceDuplicates(ctx context.Context, duplicates []*duplicateRequest, batchKey string) {
-	for _, dup := range duplicates {
-		select {
-		case <-dup.entry.done:
-		case <-ctx.Done():
-			dup.request.ResponseChan <- &batcher.Response[FleetBatchResponse]{
-				Payload: FleetBatchResponse{Error: fmt.Errorf("context canceled while waiting for in-flight fleet: %w", ctx.Err())},
-			}
-			continue
-		}
-		if dup.entry.err != nil {
-			dup.request.ResponseChan <- &batcher.Response[FleetBatchResponse]{
-				Payload: FleetBatchResponse{Error: fmt.Errorf("coalesced fleet LRO failed: %w", dup.entry.err)},
-			}
-		} else {
-			dup.request.ResponseChan <- &batcher.Response[FleetBatchResponse]{
-				Payload: FleetBatchResponse{Error: fmt.Errorf("batch key %s: %w", batchKey, ErrFleetCoalesced)},
-			}
-		}
-	}
-}
-
-// removeEntry removes a completed entry from the group. If the group is empty,
-// cleans up the sync.Map entry.
-func (e *executor) removeEntry(group *inflightGroup, entry *inflightEntry) {
-	group.mu.Lock()
-	for i, ent := range group.entries {
-		if ent == entry {
-			group.entries = append(group.entries[:i], group.entries[i+1:]...)
-			break
-		}
-	}
-	empty := len(group.entries) == 0
-	group.mu.Unlock()
-
-	// If no more entries for this key, remove the group from the map.
-	// Note: there's a tiny race where a new entry could be added between
-	// the check and the delete, but LoadOrStore in getOrCreateGroup handles
-	// this safely — worst case is a redundant empty group object.
-	if empty {
-		e.inflight.Range(func(key, value any) bool {
-			if value == group {
-				e.inflight.Delete(key)
-				return false
-			}
-			return true
-		})
-	}
-}
-
-
-// doFleetCreate performs the actual Fleet PUT → LRO → VM list → assignment → distribute flow.
+// doFleetCreate performs the actual Fleet PUT -> VM list -> assignment -> distribute flow.
 // Returns the number of VMs created and requested, plus an error if the Fleet LRO
 // or VM listing failed. The caller uses vmsCreated vs vmsRequested to decide
 // whether to keep the inflight cooldown (fully fulfilled) or clear immediately
@@ -408,7 +235,7 @@ func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch
 	// 3. Build fleet body from the representative request (all requests in same batch
 	//    share the same template/image/subnet per batch key guarantee).
 	//    Inject fleet-name tag so we can discover the VMs after LRO.
-	fields := extractBatchKeyFields(representative)
+	fields := extractBatchKeyFieldsFromRequest(representative)
 	fleetTags := make(map[string]*string, len(representative.Tags)+1)
 	for k, v := range representative.Tags {
 		fleetTags[k] = v
@@ -436,25 +263,49 @@ func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch
 			v.Info("fleet request body marshal failed", "error", mErr.Error())
 		}
 	}
-	poller, err := e.fleetClient.BeginCreateOrUpdate(ctx, e.resourceGroup, name, *fleetBody, nil)
+	// We intentionally do NOT poll the LRO to completion. The Fleet PUT is treated
+	// as synchronous: BeginCreateOrUpdate has already issued the request and received
+	// the initial (sync-path) response by the time it returns, so we rely on that
+	// response and proceed directly to listing the VMs the Fleet created.
+	//
+	// The interconnect fields are not expressible via the typed armcomputefleet/v2
+	// SDK (see rawproperties.go), so they're passed via context to the raw-properties
+	// pipeline policy registered on the Fleet client, set here immediately before the call.
+	putCtx := WithInterconnectPatch(ctx, InterconnectPatch{
+		InterconnectBlockID:    fields.InterconnectBlockID,
+		InterconnectGroupID:    fields.InterconnectGroupID,
+		InterconnectSubgroupID: fields.InterconnectSubgroupID,
+	})
+	poller, err := e.fleetClient.BeginCreateOrUpdate(putCtx, e.resourceGroup, name, *fleetBody, nil)
 	if err != nil {
 		logger.Error(err, "fleet BeginCreateOrUpdate failed")
 		fleetErr := fmt.Errorf("fleet create: %w", err)
 		e.distributeError(batch, fleetErr)
 		return 0, requested, fleetErr
 	}
-
-	// 5. Poll LRO to completion.
-	_, err = poller.PollUntilDone(ctx, nil)
-	if err != nil {
-		logger.Error(err, "fleet LRO poll failed")
-		lroErr := fmt.Errorf("fleet LRO: %w", err)
-		e.distributeError(batch, lroErr)
-		return 0, requested, lroErr
+	// Log poller/response state to diagnose whether Fleet completed synchronously
+	pollerDone := poller != nil && poller.Done()
+	logger.Info("fleet create-or-update returned",
+		"pollerNil", poller == nil,
+		"pollerDone", pollerDone,
+	)
+	if pollerDone {
+		resp, respErr := poller.Result(ctx)
+		if respErr != nil {
+			logger.Error(respErr, "fleet poller.Result() failed")
+		} else {
+			fleetState := ""
+			if resp.Properties != nil && resp.Properties.ProvisioningState != nil {
+				fleetState = string(*resp.Properties.ProvisioningState)
+			}
+			logger.Info("fleet poller.Result()",
+				"provisioningState", fleetState,
+				"fleetID", lo.FromPtr(resp.ID),
+			)
+		}
 	}
-	logger.Info("fleet LRO completed")
 
-	// 6. List VMs created by this Fleet (identified by fleet-name tag).
+	// 5. List VMs created by this Fleet (identified by fleet-name tag).
 	vms, err := e.listFleetVMs(ctx, name)
 	if err != nil {
 		logger.Error(err, "failed to list fleet VMs")
@@ -463,6 +314,14 @@ func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch
 		return 0, requested, listErr
 	}
 	logger.Info("listed fleet VMs", "count", len(vms))
+
+	if len(vms) == 0 {
+		logger.Info("WARNING: fleet returned 0 VMs after successful PUT",
+			"fleetName", name,
+			"requestedCapacity", len(batch.Requests),
+			"hint", "Fleet API may have succeeded without provisioning VMs (capacity/quota issue)",
+		)
+	}
 
 	sharedState := NewFleetSharedState(
 		requests,
@@ -476,13 +335,13 @@ func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch
 	// Run assignment only (fast, in-memory) — determines which VM goes to which NodeClaim.
 	sharedState.runAssignment(ctx)
 
-	// 7. Distribute shared state to all requests immediately, so promises get
-	// providerIDs without waiting for VM tagging (which is slow, ~30s per VM).
+	// 6. Distribute shared state to all requests. Promises read providerIDs from it.
 	e.distributeSharedState(batch, sharedState)
 
-	// 8. Tag VMs and delete surplus in the background. Tagging is best-effort
-	// housekeeping for Fleet VM GC — not on the critical path for node registration.
-	go sharedState.runTaggingAndCleanup(ctx)
+	// Tagging of assigned VMs is handled out-of-band by the fleettag controller.
+	// Surplus VMs (created but never assigned to a NodeClaim) are reclaimed by the
+	// generic instance garbage collector, which matches cloud VMs to NodeClaims by
+	// ProviderID and deletes any that have no owning NodeClaim.
 
 	return len(vms), requested, nil
 }
@@ -524,46 +383,157 @@ func fleetName(clusterName, batchKey string) string {
 	return fmt.Sprintf("fleet-%s-%s-%s", clusterName, hash, suffix)
 }
 
-// extractBatchKeyFields builds the BatchKeyFields from a FleetVMProvisionRequest.
-// Used by the executor to pass to BuildFleetBody.
-func extractBatchKeyFields(req *FleetVMProvisionRequest) BatchKeyFields {
-	return BatchKeyFields{
-		NodePoolName:        req.NodeClaim.Labels[karpv1.NodePoolLabelKey],
-		CapacityType:        req.CapacityType,
-		ImageID:             req.LaunchTemplate.ImageID,
-		SubnetID:            req.LaunchTemplate.SubnetID,
-		SSHPublicKey:        req.SSHPublicKey,
-		AdminUsername:       req.AdminUsername,
-		CustomData:          req.LaunchTemplate.ScriptlessCustomData,
-		OSDiskSizeGB:        int(req.LaunchTemplate.StorageProfileSizeGB),
-		OSDiskType:          string(req.LaunchTemplate.StorageProfilePlacement),
-		EncryptionAtHost:    req.NodeClass.GetEncryptionAtHost(),
-		DiskEncryptionSetID: req.DiskEncryptionSetID,
-		NodeIdentities:      joinSorted(req.NodeIdentities),
-		NSG:                 req.NSG,
-		CandidateSKUs:       sortedCopy(req.AcceptableSKUs),
-		Zones:               sortedCopy(req.AcceptableZones),
-	}
-}
-
-// listFleetVMs lists all VMs in the resource group that carry the fleet-name tag
-// matching the given name. This discovers VMs created by the Fleet VMSS Flex.
+// listFleetVMs lists VMs belonging to a specific Fleet using the Fleet's ListVirtualMachines API.
+// This returns VMs that the Fleet created, identified by fleet name directly (no tag filtering needed).
 func (e *executor) listFleetVMs(ctx context.Context, name string) ([]*armcompute.VirtualMachine, error) {
-	pager := e.vmClient.NewListPager(e.resourceGroup, nil)
-	var vms []*armcompute.VirtualMachine
+	logger := log.FromContext(ctx).WithValues("fleetName", name)
+
+	// Use the Fleet SDK's dedicated ListVirtualMachines API
+	pager := e.fleetClient.NewListVirtualMachinesPager(e.resourceGroup, name, nil)
+	var fleetVMs []*armcomputefleet.VirtualMachine
+	pageNum := 0
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("listing VMs page: %w", err)
+			return nil, fmt.Errorf("listing fleet VMs via fleet API: %w", err)
 		}
-		for _, vm := range page.Value {
-			if vm == nil || vm.Tags == nil {
-				continue
-			}
-			if tagVal, ok := vm.Tags[FleetNameTagKey]; ok && tagVal != nil && *tagVal == name {
-				vms = append(vms, vm)
-			}
+		pageNum++
+		fleetVMs = append(fleetVMs, page.Value...)
+
+		// Log raw response
+		if rawJSON, mErr := json.Marshal(page); mErr == nil {
+			logger.Info("listFleetVMs raw page response", "page", pageNum, "json", string(rawJSON))
 		}
 	}
+
+	logger.Info("listFleetVMs complete (fleet API)", "fleetVMCount", len(fleetVMs), "pages", pageNum)
+
+	if len(fleetVMs) == 0 {
+		return nil, nil
+	}
+
+	// The Fleet API returns fleet VirtualMachine objects (with ID/Name/OperationStatus).
+	// We need to fetch the full compute VM objects for assignment.
+	// NOTE: We only extract minimal fields (ID, Name, VMSize, Zone, ProvisioningState)
+	// to simulate what the future Fleet ListVirtualMachines API will provide directly.
+	// The full VM object is fetched later in FleetMemberPromise.Wait() via polling.
+	var vms []*armcompute.VirtualMachine
+	for _, fvm := range fleetVMs {
+		if fvm == nil || fvm.Name == nil {
+			continue
+		}
+		vmName := *fvm.Name
+		opStatus := ""
+		if fvm.OperationStatus != nil {
+			opStatus = string(*fvm.OperationStatus)
+		}
+		logger.Info("fleet VM", "vm", vmName, "operationStatus", opStatus, "id", lo.FromPtr(fvm.ID))
+
+		// Only include VMs that are successfully created at Fleet level.
+		// VMs with OperationStatus=Failed never got created in ARM; no point polling them.
+		if fvm.OperationStatus != nil && *fvm.OperationStatus == armcomputefleet.VMOperationStatusFailed {
+			logger.Info("skipping failed fleet VM", "vm", vmName)
+			continue
+		}
+
+		// Fetch VM to get minimal fields (simulating future Fleet ListVMs API enrichment).
+		// Only extract: ID, Name, VMSize, Zone, ProvisioningState.
+		//
+		// Fleet's ListVirtualMachines API can list a VM before the standalone armcompute
+		// VirtualMachines GET API can find it (brief ARM propagation lag), which surfaces
+		// as a 404 here immediately after Fleet creation. Wait/retry through that 404
+		// instead of dropping the VM: previously, dropping it here caused runAssignment to
+		// see 0 usable VMs, fail the whole batch's NodeClaims, and each failed NodeClaim
+		// retry would create yet another brand-new Fleet (fleet names are randomized per
+		// invocation), compounding into many orphaned Fleets/VMs for one logical request.
+		vmResp, err := e.getVMWaitingForVisibility(ctx, vmName, logger)
+		if err != nil {
+			logger.Error(err, "failed to get VM details", "vm", vmName)
+			continue
+		}
+
+		// Build a minimal VM object with only the fields the Fleet ListVMs API will provide.
+		// This simulates the future API response where these fields come directly from Fleet.
+		//
+		// Location is set from e.location (the executor's own Fleet region), not from
+		// vmResp: every VM a Fleet creates lives in that Fleet's region, so this avoids
+		// an extra dependency on the VM Get() response. It is required by skuAndZone/
+		// MakeAKSLabelZoneFromVM to build the AKS zone label for zonal VMs; without it,
+		// every zonal VM fails zone resolution, is dropped to surplus, and its NodeClaim
+		// gets a spurious insufficient-capacity error.
+		minimalVM := &armcompute.VirtualMachine{
+			ID:       vmResp.VirtualMachine.ID,
+			Name:     vmResp.VirtualMachine.Name,
+			Type:     vmResp.VirtualMachine.Type,
+			Location: lo.ToPtr(e.location),
+		}
+		if vmResp.VirtualMachine.Properties != nil {
+			minimalVM.Properties = &armcompute.VirtualMachineProperties{
+				ProvisioningState: vmResp.VirtualMachine.Properties.ProvisioningState,
+			}
+			if vmResp.VirtualMachine.Properties.HardwareProfile != nil {
+				minimalVM.Properties.HardwareProfile = &armcompute.HardwareProfile{
+					VMSize: vmResp.VirtualMachine.Properties.HardwareProfile.VMSize,
+				}
+			}
+		}
+		if len(vmResp.VirtualMachine.Zones) > 0 {
+			minimalVM.Zones = vmResp.VirtualMachine.Zones
+		}
+		vms = append(vms, minimalVM)
+	}
+
+	logger.Info("listFleetVMs resolved compute VMs", "resolvedCount", len(vms), "fleetVMCount", len(fleetVMs))
 	return vms, nil
+}
+
+// getVMWaitingForVisibility calls e.vmClient.Get, and if the response is a 404
+// (ResourceNotFound), retries on a fixed interval until the VM becomes visible, a
+// non-404 error occurs, or e.vmVisibilityMaxWait elapses. This bridges the ARM
+// propagation lag between Fleet's ListVirtualMachines reporting a VM and that VM
+// becoming resolvable through the standalone armcompute VirtualMachines GET API.
+func (e *executor) getVMWaitingForVisibility(ctx context.Context, vmName string, logger logr.Logger) (armcompute.VirtualMachinesClientGetResponse, error) {
+	pollInterval := e.vmVisibilityPollInterval
+	if pollInterval <= 0 {
+		pollInterval = DefaultVMVisibilityPollInterval
+	}
+	maxWait := e.vmVisibilityMaxWait
+	if maxWait <= 0 {
+		maxWait = DefaultVMVisibilityMaxWait
+	}
+
+	var (
+		vmResp armcompute.VirtualMachinesClientGetResponse
+		getErr error
+	)
+	// PollUntilContextTimeout derives its own deadline context internally from ctx,
+	// so no manual context.WithTimeout wrapping is needed here.
+	pollErr := wait.PollUntilContextTimeout(ctx, pollInterval, maxWait, true, func(pollCtx context.Context) (bool, error) {
+		vmResp, getErr = e.vmClient.Get(pollCtx, e.resourceGroup, vmName, nil)
+		if getErr == nil {
+			return true, nil
+		}
+		if !isNotFoundError(getErr) {
+			// Non-404 error (auth, throttling, etc.): stop retrying, surface immediately.
+			return false, getErr
+		}
+		logger.V(1).Info("VM not yet visible via GET, waiting for ARM propagation", "vm", vmName, "error", getErr.Error())
+		return false, nil
+	})
+	if pollErr != nil {
+		if errors.Is(pollErr, context.DeadlineExceeded) {
+			return armcompute.VirtualMachinesClientGetResponse{}, fmt.Errorf("VM %q did not become visible within %s: %w", vmName, maxWait, getErr)
+		}
+		return armcompute.VirtualMachinesClientGetResponse{}, pollErr
+	}
+	return vmResp, nil
+}
+
+// isNotFoundError reports whether err is an Azure ResponseError with a 404 status code.
+func isNotFoundError(err error) bool {
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == http.StatusNotFound
+	}
+	return false
 }

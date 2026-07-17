@@ -32,8 +32,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
-	"github.com/Azure/karpenter-provider-azure/pkg/controllers/fleetgc"
-	"github.com/Azure/karpenter-provider-azure/pkg/controllers/fleetvmgc"
+	"github.com/Azure/karpenter-provider-azure/pkg/controllers/fleettag"
 	nodeclaimgarbagecollection "github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/garbagecollection"
 	nodeclasshash "github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/hash"
 	nodeclassstatus "github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
@@ -69,7 +68,7 @@ func NewControllers(
 	parsedDiskEncryptionSetID *arm.ResourceID,
 	networkPolicy string,
 	networkPlugin string,
-	fleetClient fleet.FleetAPI,
+	fleetVMClient fleet.VMAPI,
 ) []controller.Controller {
 	controllers := []controller.Controller{
 		nodeclasshash.NewController(kubeClient),
@@ -79,7 +78,6 @@ func NewControllers(
 		nodeclaimgarbagecollection.NewInstance(kubeClient, cloudProvider),
 		nodeclaimgarbagecollection.NewNetworkInterface(kubeClient, vmInstanceProvider),
 
-		// TODO: nodeclaim tagging
 		inplaceupdate.NewController(kubeClient, vmInstanceProvider, aksMachineInstanceProvider),
 		status.NewController[*v1beta1.AKSNodeClass](kubeClient, mgr.GetEventRecorderFor("karpenter")),
 
@@ -87,17 +85,13 @@ func NewControllers(
 	}
 
 	if options.FromContext(ctx).IsFleetMode() {
-		controllers = append(controllers, fleetgc.NewController(
-			fleetClient,
+		controllers = append(controllers, fleettag.NewController(
 			kubeClient,
+			vmInstanceProvider,
+			fleetVMClient,
 			options.FromContext(ctx).ClusterName,
 			options.FromContext(ctx).NodeResourceGroup,
-		))
-		controllers = append(controllers, fleetvmgc.NewController(
-			vmInstanceProvider,
-			options.FromContext(ctx).ClusterName,
-			options.FromContext(ctx).FleetVMGCInterval,
-			options.FromContext(ctx).FleetVMGCGracePeriod,
+			options.FromContext(ctx).FleetTagInterval,
 		))
 	}
 

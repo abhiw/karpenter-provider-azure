@@ -41,89 +41,83 @@ type VMAssignmentRequest struct {
 	ResponseChan    chan *batcher.Response[FleetBatchResponse]
 }
 
-// skuZoneKey is the bucket key for assignment: a (SKU, Zone) pair.
-type skuZoneKey struct {
-	SKU  string
-	Zone string
-}
-
-// AssignVMsToNodeClaims matches Fleet-created VMs to NodeClaim requests by SKU×zone
-// in FIFO order over each request's cross-product of AcceptableSKUs × AcceptableZones.
+// AssignVMsToNodeClaims matches Fleet-created VMs to NodeClaim requests in pure
+// FIFO order: the Nth request (in slice order) is assigned the Nth well-formed VM
+// (in slice order), regardless of SKU or zone. Fleet already selected the SKU/zone
+// per its allocation strategy, so the provider does not re-match on (SKU, zone) —
+// the assignment simply records whatever SKU/zone the VM actually has.
 //
 // The function is pure: it does not modify the input slices and has no external side effects.
 //
 // Returns:
-//   - assigned: nodeClaimName → FleetAssignment for every request that found a VM
-//   - unmatched: requests that could not be satisfied by any (sku, zone) bucket
-//   - surplus: VMs in arbitrary order that were not claimed by any request
+//   - assigned: nodeClaimName → FleetAssignment for every request that received a VM
+//   - unmatched: requests left over when there are fewer VMs than requests
+//   - surplus: VMs left over when there are more VMs than requests, plus any
+//     malformed VMs (missing SKU) that can never be assigned
 //
-// The instanceTypes parameter is currently unused; per-request InstanceTypes drive
-// the lookup. TODO(fleet-poc-mh-executor): drop this parameter once the executor wires up.
+// instanceTypes is the merged SKU → InstanceType map; it (falling back to the
+// request's own InstanceTypes) is used to populate FleetAssignment.InstanceType.
 func AssignVMsToNodeClaims(
 	requests []*VMAssignmentRequest,
 	vms []*armcompute.VirtualMachine,
-	_ map[string]*cloudprovider.InstanceType,
+	instanceTypes map[string]*cloudprovider.InstanceType,
 ) (assigned map[string]*FleetAssignment, unmatched []*VMAssignmentRequest, surplus []*armcompute.VirtualMachine) {
 	if len(requests) == 0 && len(vms) == 0 {
 		return nil, nil, nil
 	}
 
-	// 1. Build SKU×Zone buckets from VMs.
-	buckets := make(map[skuZoneKey][]*armcompute.VirtualMachine, len(vms))
+	// 1. Split VMs into assignable (well-formed) and malformed. Malformed VMs can
+	//    never map to a NodeClaim, so they go straight to surplus.
+	assignable := make([]*armcompute.VirtualMachine, 0, len(vms))
 	for _, vm := range vms {
-		sku, zone, ok := skuAndZone(vm)
-		if !ok {
-			// Malformed VM — treat as surplus so the caller can decide to log/delete.
+		if _, _, ok := skuAndZone(vm); !ok {
 			surplus = append(surplus, vm)
 			continue
 		}
-		key := skuZoneKey{SKU: sku, Zone: zone}
-		buckets[key] = append(buckets[key], vm)
+		assignable = append(assignable, vm)
 	}
 
-	// 2. Match requests in FIFO order.
+	// 2. Pair requests with assignable VMs in FIFO order.
 	assigned = make(map[string]*FleetAssignment, len(requests))
+	next := 0
 	for _, req := range requests {
 		if req == nil {
 			continue
 		}
-		if vm, sku, zone, ok := popMatch(buckets, req); ok {
-			assigned[req.NodeClaimName] = &FleetAssignment{
-				VM:           vm,
-				InstanceType: req.InstanceTypes[sku],
-				Zone:         zone,
-			}
+		if next >= len(assignable) {
+			unmatched = append(unmatched, req)
 			continue
 		}
-		unmatched = append(unmatched, req)
+		vm := assignable[next]
+		next++
+		sku, zone, _ := skuAndZone(vm)
+		assigned[req.NodeClaimName] = &FleetAssignment{
+			VM:           vm,
+			InstanceType: instanceTypeForSKU(sku, req, instanceTypes),
+			Zone:         zone,
+		}
 	}
 
-	// 3. Remaining VMs in buckets are surplus.
-	for _, remaining := range buckets {
-		surplus = append(surplus, remaining...)
+	// 3. Any assignable VMs beyond the number of requests are surplus.
+	if next < len(assignable) {
+		surplus = append(surplus, assignable[next:]...)
 	}
 	return assigned, unmatched, surplus
 }
 
-// popMatch walks the cross-product of req.AcceptableSKUs × req.AcceptableZones in slice
-// order and returns the first available VM, removing it from the bucket. Returns ok=false
-// if no combination matches.
-func popMatch(buckets map[skuZoneKey][]*armcompute.VirtualMachine, req *VMAssignmentRequest) (
-	*armcompute.VirtualMachine, string, string, bool,
-) {
-	for _, sku := range req.AcceptableSKUs {
-		for _, zone := range req.AcceptableZones {
-			key := skuZoneKey{SKU: sku, Zone: zone}
-			bucket := buckets[key]
-			if len(bucket) == 0 {
-				continue
-			}
-			vm := bucket[0]
-			buckets[key] = bucket[1:]
-			return vm, sku, zone, true
+// instanceTypeForSKU resolves the InstanceType for a VM's SKU, preferring the
+// request's own InstanceTypes map and falling back to the merged map. Returns
+// nil if the SKU is not present in either (the assignment is still valid).
+func instanceTypeForSKU(sku string, req *VMAssignmentRequest, merged map[string]*cloudprovider.InstanceType) *cloudprovider.InstanceType {
+	if req != nil && req.InstanceTypes != nil {
+		if it, ok := req.InstanceTypes[sku]; ok {
+			return it
 		}
 	}
-	return nil, "", "", false
+	if merged != nil {
+		return merged[sku]
+	}
+	return nil
 }
 
 // skuAndZone extracts the SKU string and AKS-label zone from a Fleet-created VM.

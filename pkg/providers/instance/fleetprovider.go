@@ -33,6 +33,8 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/fleet"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/offerings"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/labels"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
@@ -65,6 +67,10 @@ type DefaultFleetProvider struct {
 	subscriptionID               string
 	diskEncryptionSetID          string
 	maxCandidateSKUs             int // max SKUs to pass to Fleet vmSizesProfile (default 10)
+	// Fields for provisioning state polling and error handling in FleetMemberPromise.Wait()
+	vmClient             fleet.VMAPI
+	errorHandling        *offerings.ResponseErrorHandler
+	instanceTypeProvider instancetype.Provider
 }
 
 // NewFleetProvider creates a new DefaultFleetProvider.
@@ -81,6 +87,9 @@ func NewFleetProvider(
 	vmProvider VMProvider,
 	location, resourceGroup, subscriptionID, diskEncryptionSetID string,
 	maxCandidateSKUs int,
+	vmClient fleet.VMAPI,
+	errorHandling *offerings.ResponseErrorHandler,
+	instanceTypeProvider instancetype.Provider,
 ) *DefaultFleetProvider {
 	if maxCandidateSKUs <= 0 {
 		maxCandidateSKUs = defaultMaxCandidateSKUs
@@ -97,6 +106,9 @@ func NewFleetProvider(
 		subscriptionID:               subscriptionID,
 		diskEncryptionSetID:          diskEncryptionSetID,
 		maxCandidateSKUs:             maxCandidateSKUs,
+		vmClient:                     vmClient,
+		errorHandling:                errorHandling,
+		instanceTypeProvider:         instanceTypeProvider,
 	}
 }
 
@@ -181,6 +193,9 @@ func (p *DefaultFleetProvider) BeginCreate(
 		LBBackendPools:      backendPools.IPv4PoolIDs,
 		Location:            p.location,
 		Extensions:          extensions,
+		InterconnectBlockID:    lo.FromPtr(nodeClass.Spec.InterconnectBlockID),
+		InterconnectGroupID:    lo.FromPtr(nodeClass.Spec.InterconnectGroupID),
+		InterconnectSubgroupID: lo.FromPtr(nodeClass.Spec.InterconnectSubgroupID),
 	}
 
 	// 9. Compute deterministic fleet name from batch key.
@@ -199,11 +214,16 @@ func (p *DefaultFleetProvider) BeginCreate(
 
 	// 11. Build and return FleetMemberPromise.
 	return &FleetMemberPromise{
-		sharedState:   resp.SharedState,
-		nodeClaimName: nodeClaim.Name,
-		capacityType:  capacityType,
-		fleetName:     fleetName,
-		vmProvider:    p.vmProvider,
+		sharedState:          resp.SharedState,
+		nodeClaimName:        nodeClaim.Name,
+		capacityType:         capacityType,
+		fleetName:            fleetName,
+		vmProvider:           p.vmProvider,
+		ctx:                  ctx,
+		vmClient:             p.vmClient,
+		resourceGroup:        p.resourceGroup,
+		errorHandling:        p.errorHandling,
+		instanceTypeProvider: p.instanceTypeProvider,
 	}, resp.Error
 }
 

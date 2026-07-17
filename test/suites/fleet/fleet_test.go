@@ -300,64 +300,6 @@ var _ = Describe("Fleet", func() {
 			env.EventuallyExpectVMNotFound(vmName, 10*time.Minute)
 		})
 	})
-
-	// Verifies the per-VM Fleet garbage collector (fleetvmgc):
-	// A VM that carries the fleet-name tag but is missing the nodeclaim-name tag is a leak
-	// candidate. Once it is older than FLEET_VM_GC_GRACE_PERIOD, fleetvmgc must delete it.
-	//
-	// PRE-REQUISITE: the in-cluster controller should be running with a moderate grace
-	// (e.g. FLEET_VM_GC_GRACE_PERIOD=10m, FLEET_VM_GC_INTERVAL=30s) on the karpenter
-	// deployment. Anything < ~5m races the normal Wait()/tag flow and will delete healthy
-	// in-flight VMs (FALSE POSITIVES). Anything > ~15m makes the 20m EventuallyExpect
-	// budget below too tight.
-	Describe("Per-VM Fleet GC", func() {
-		It("should delete a Fleet VM that lost its nodeclaim-name tag", func() {
-			nodePool = test.ReplaceRequirements(nodePool, karpv1.NodeSelectorRequirementWithMinValues{
-				Key:      karpv1.CapacityTypeLabelKey,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{karpv1.CapacityTypeOnDemand},
-			})
-			env.ExpectCreated(nodePool, nodeClass)
-
-			podLabels := map[string]string{"app": "fleet-gc-test"}
-			dep := test.Deployment(test.DeploymentOptions{
-				Replicas: 1,
-				PodOptions: test.PodOptions{
-					ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
-					ResourceRequirements: corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse("100m"),
-							corev1.ResourceMemory: resource.MustParse("128Mi"),
-						},
-					},
-					TerminationGracePeriodSeconds: lo.ToPtr(int64(0)),
-				},
-			})
-			env.ExpectCreated(dep)
-
-			env.EventuallyExpectHealthyPodCount(labels.SelectorFromSet(dep.Spec.Selector.MatchLabels), 1)
-			nodes := env.ExpectCreatedNodeCount("==", 1)
-			vmName := env.ExpectParsedProviderID(nodes[0].Spec.ProviderID)
-
-			// Confirm the production code did stamp both fleet-name and nodeclaim-name tags;
-			// if it didn't, the GC scenario below would be testing the wrong thing.
-			vm := env.GetVMByName(vmName)
-			Expect(vm.Tags).To(HaveKey("karpenter.azure.com_fleet-name"),
-				"Fleet-provisioned VM is missing fleet-name tag; executor.go regressed")
-			Expect(vm.Tags).To(HaveKey("karpenter.azure.com_nodeclaim-name"),
-				"Fleet-provisioned VM is missing nodeclaim-name tag; sharedstate.go regressed")
-
-			// Simulate the "orphan" state. Either GC controller (instance.gc on ProviderID-mismatch
-			// or fleetvmgc on tag-mismatch) is acceptable here: from the e2e perspective, the
-			// orphan VM must eventually be reaped.
-			env.ExpectRemoveVMTag(vmName, "karpenter.azure.com_nodeclaim-name")
-
-			// Allow extra wall-clock time so fleetvmgc grace + reconcile interval can elapse.
-			env.EventuallyExpectVMNotFound(vmName, 20*time.Minute)
-
-			env.ExpectDeleted(dep)
-		})
-	})
 })
 
 // listFleets returns all Fleet resources in the node resource group.

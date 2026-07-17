@@ -18,7 +18,6 @@ package fleet
 
 import (
 	"context"
-	"errors"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -31,29 +30,18 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 )
 
-// ErrFleetCoalesced is returned to coalesced batches (duplicate provisioning
-// due to provisioner re-triggers). Callers should treat this as a signal to
-// delete the duplicate NodeClaim rather than retrying, since the original
-// batch already provisioned VMs for the same pods.
-var ErrFleetCoalesced = errors.New("fleet provisioning coalesced: duplicate NodeClaim from provisioner re-trigger")
-
-// IsFleetCoalescedError returns true if the error (or any wrapped error) is
-// ErrFleetCoalesced. Used by CloudProvider to convert this into an
-// InsufficientCapacityError so the lifecycle controller deletes the NodeClaim.
-func IsFleetCoalescedError(err error) bool {
-	return errors.Is(err, ErrFleetCoalesced)
-}
-
 // FleetAPI abstracts the Azure Compute Fleet SDK client for testability.
 type FleetAPI interface {
 	BeginCreateOrUpdate(ctx context.Context, resourceGroupName string, fleetName string, resource armcomputefleet.Fleet, options *armcomputefleet.FleetsClientBeginCreateOrUpdateOptions) (*runtime.Poller[armcomputefleet.FleetsClientCreateOrUpdateResponse], error)
 	Get(ctx context.Context, resourceGroupName string, fleetName string, options *armcomputefleet.FleetsClientGetOptions) (armcomputefleet.FleetsClientGetResponse, error)
 	BeginDelete(ctx context.Context, resourceGroupName string, fleetName string, options *armcomputefleet.FleetsClientBeginDeleteOptions) (*runtime.Poller[armcomputefleet.FleetsClientDeleteResponse], error)
 	NewListByResourceGroupPager(resourceGroupName string, options *armcomputefleet.FleetsClientListByResourceGroupOptions) *runtime.Pager[armcomputefleet.FleetsClientListByResourceGroupResponse]
+	NewListVirtualMachinesPager(resourceGroupName string, name string, options *armcomputefleet.FleetsClientListVirtualMachinesOptions) *runtime.Pager[armcomputefleet.FleetsClientListVirtualMachinesResponse]
 }
 
 // VMAPI abstracts the VM operations needed for listing, tagging, and deleting assigned VMs.
 type VMAPI interface {
+	Get(ctx context.Context, resourceGroupName string, vmName string, options *armcompute.VirtualMachinesClientGetOptions) (armcompute.VirtualMachinesClientGetResponse, error)
 	BeginUpdate(ctx context.Context, resourceGroupName string, vmName string, parameters armcompute.VirtualMachineUpdate, options *armcompute.VirtualMachinesClientBeginUpdateOptions) (*runtime.Poller[armcompute.VirtualMachinesClientUpdateResponse], error)
 	BeginDelete(ctx context.Context, resourceGroupName string, vmName string, options *armcompute.VirtualMachinesClientBeginDeleteOptions) (*runtime.Poller[armcompute.VirtualMachinesClientDeleteResponse], error)
 	NewListPager(resourceGroupName string, options *armcompute.VirtualMachinesClientListOptions) *runtime.Pager[armcompute.VirtualMachinesClientListResponse]
@@ -78,6 +66,14 @@ type FleetVMProvisionRequest struct {
 	LBBackendPools      []string
 	Location            string
 	Extensions          []*armcompute.VirtualMachineExtension
+
+	// Interconnect topology fields, sourced from AKSNodeClass.Spec.InterconnectBlockID /
+	// InterconnectGroupID / InterconnectSubgroupID. Empty when unset. Applied to the Fleet
+	// PUT body via a raw-JSON patch since the vendored armcomputefleet/v2 SDK does not expose
+	// these ARM properties as typed fields (see rawproperties.go).
+	InterconnectBlockID    string
+	InterconnectGroupID    string
+	InterconnectSubgroupID string
 }
 
 // FleetBatchResponse is the per-request response returned from the batcher.
@@ -87,13 +83,13 @@ type FleetBatchResponse struct {
 }
 
 // FleetSharedState is shared across all promises in the same batch.
-// It stores the assignment results after the Fleet LRO completes.
-// The executor builds this struct, then calls runAssignmentAndCleanup() to
-// compute assignments and run tagging + surplus-delete BEFORE handing the
-// state to any FleetMemberPromise. Promises only ever read from this state.
+// It stores the assignment results after the Fleet VMs are listed.
+// The executor builds this struct, then calls runAssignment() to compute
+// assignments BEFORE handing the state to any FleetMemberPromise. Promises
+// only ever read from this state. Tagging is handled by the fleettag controller
+// and surplus reclamation by the generic instance garbage collector.
 type FleetSharedState struct {
 	assignments map[string]*FleetAssignment // nodeClaimName → assignment
-	surplus     []*armcompute.VirtualMachine
 	err         error
 
 	// Inputs set by executor before handing to promises

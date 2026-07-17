@@ -147,9 +147,10 @@ func TestAssign_SurplusVMs(t *testing.T) {
 	g.Expect(surplus).To(HaveLen(2))
 }
 
-// TestAssign_NoOverlap verifies that when no VM matches any request's SKU/zone,
-// all requests are unmatched and all VMs are surplus.
-func TestAssign_NoOverlap(t *testing.T) {
+// TestAssign_MismatchedSKUZoneStillAssignedFIFO verifies that assignment is pure
+// FIFO: a request is assigned the next VM in order even when the VM's SKU/zone
+// differ from what the request nominally listed (Fleet already chose the SKU/zone).
+func TestAssign_MismatchedSKUZoneStillAssignedFIFO(t *testing.T) {
 	g := NewWithT(t)
 
 	requests := []*VMAssignmentRequest{
@@ -160,13 +161,14 @@ func TestAssign_NoOverlap(t *testing.T) {
 	}
 
 	assigned, unmatched, surplus := AssignVMsToNodeClaims(requests, vms, nil)
-	g.Expect(assigned).To(BeEmpty())
-	g.Expect(unmatched).To(HaveLen(1))
-	g.Expect(surplus).To(HaveLen(1))
+	g.Expect(assigned).To(HaveLen(1))
+	g.Expect(assigned["nc-1"].Zone).To(Equal("westus-2"))
+	g.Expect(unmatched).To(BeEmpty())
+	g.Expect(surplus).To(BeEmpty())
 }
 
-// TestAssign_MultiSKU verifies that a request accepting multiple SKUs matches
-// a VM with any one of those SKUs.
+// TestAssign_MultiSKU verifies that the FleetAssignment records the InstanceType
+// matching the VM's actual SKU (resolved from the request's InstanceTypes map).
 func TestAssign_MultiSKU(t *testing.T) {
 	g := NewWithT(t)
 
@@ -174,7 +176,7 @@ func TestAssign_MultiSKU(t *testing.T) {
 		mkAssignReq("nc-1", []string{"Standard_D4s_v3", "Standard_D8s_v3"}, []string{"westus-1"}),
 	}
 	vms := []*armcompute.VirtualMachine{
-		mkVM("Standard_D8s_v3", "westus-1"), // only the second SKU is available
+		mkVM("Standard_D8s_v3", "westus-1"),
 	}
 
 	assigned, unmatched, surplus := AssignVMsToNodeClaims(requests, vms, nil)
@@ -184,8 +186,7 @@ func TestAssign_MultiSKU(t *testing.T) {
 	g.Expect(surplus).To(BeEmpty())
 }
 
-// TestAssign_MultiZone verifies that a request accepting multiple zones matches
-// a VM in any one of those zones.
+// TestAssign_MultiZone verifies the FleetAssignment records the VM's actual zone.
 func TestAssign_MultiZone(t *testing.T) {
 	g := NewWithT(t)
 
@@ -193,7 +194,7 @@ func TestAssign_MultiZone(t *testing.T) {
 		mkAssignReq("nc-1", []string{"Standard_D4s_v3"}, []string{"westus-1", "westus-2"}),
 	}
 	vms := []*armcompute.VirtualMachine{
-		mkVM("Standard_D4s_v3", "westus-2"), // only zone-2 available
+		mkVM("Standard_D4s_v3", "westus-2"),
 	}
 
 	assigned, unmatched, _ := AssignVMsToNodeClaims(requests, vms, nil)
@@ -202,29 +203,9 @@ func TestAssign_MultiZone(t *testing.T) {
 	g.Expect(unmatched).To(BeEmpty())
 }
 
-// TestAssign_FIFOOrder verifies that the first request in slice order gets first pick
-// when multiple requests have overlapping constraints.
-func TestAssign_FIFOOrder(t *testing.T) {
-	g := NewWithT(t)
-
-	requests := []*VMAssignmentRequest{
-		mkAssignReq("nc-first", []string{"Standard_D4s_v3"}, []string{"westus-1"}),
-		mkAssignReq("nc-second", []string{"Standard_D4s_v3"}, []string{"westus-1"}),
-	}
-	vms := []*armcompute.VirtualMachine{
-		mkVM("Standard_D4s_v3", "westus-1"), // only one VM
-	}
-
-	assigned, unmatched, _ := AssignVMsToNodeClaims(requests, vms, nil)
-	g.Expect(assigned).To(HaveLen(1))
-	g.Expect(assigned).To(HaveKey("nc-first"))
-	g.Expect(unmatched).To(HaveLen(1))
-	g.Expect(unmatched[0].NodeClaimName).To(Equal("nc-second"))
-}
-
-// TestAssign_CrossProductPrefersEarlierSKU verifies that the iteration order of
-// AcceptableSKUs determines preference when multiple buckets have VMs.
-func TestAssign_CrossProductPrefersEarlierSKU(t *testing.T) {
+// TestAssign_FIFOTakesFirstVM verifies that a single request is assigned the first
+// VM in slice order, and the rest become surplus.
+func TestAssign_FIFOTakesFirstVM(t *testing.T) {
 	g := NewWithT(t)
 
 	requests := []*VMAssignmentRequest{
@@ -328,10 +309,8 @@ func TestAssign_VMsButNoRequests(t *testing.T) {
 // and vm.Location to the region (e.g. "southcentralus"). The scheduler populates
 // VMAssignmentRequest.AcceptableZones in AKS-label format ("southcentralus-3").
 //
-// If skuAndZone returns the raw "3", it never matches the request's "southcentralus-3" —
-// every Fleet-created VM would be routed to surplus and deleted by deleteSurplusVMs,
-// causing every fleet e2e to time out.
-//
+// If skuAndZone returns the raw "3", the FleetAssignment.Zone would be "3" instead
+// of "southcentralus-3", so the resulting NodeClaim would carry a wrong zone label.
 // This test directly constructs the realistic ARM payload (bypassing mkVM) to ensure
 // no future test-helper refactor can re-hide the mismatch.
 func TestAssign_ZoneFormatConversion_RawARMZoneFromAzure(t *testing.T) {

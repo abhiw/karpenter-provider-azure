@@ -21,13 +21,12 @@ import (
 	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
-	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
 // NewFleetSharedState creates a shared state for a batch. Called by the executor
-// after submitting the Fleet LRO. The VMs field is populated by the executor
+// after submitting the Fleet create. The VMs field is populated by the executor
 // after listing Fleet VMs (via ARG or VMSS list).
 func NewFleetSharedState(
 	requests []*VMAssignmentRequest,
@@ -85,9 +84,13 @@ func (s *FleetSharedState) SetError(err error) {
 // runAssignment is called by the executor exactly once, AFTER SetVMs and BEFORE
 // distributeSharedState. It only does the assignment matching (fast, in-memory)
 // so that promises receive providerIDs as quickly as possible.
-// Tagging and surplus cleanup run in the background via runTaggingAndCleanup.
+//
+// Tagging of assigned VMs is performed out-of-band by the fleettag controller.
+// Surplus VMs (created but never assigned to a NodeClaim) are reclaimed by the
+// generic instance garbage collector via ProviderID, so this function does not
+// delete them.
 func (s *FleetSharedState) runAssignment(ctx context.Context) {
-	// If executor already set an error (LRO failure), short-circuit.
+	// If executor already set an error (create failure), short-circuit.
 	if s.err != nil {
 		return
 	}
@@ -101,68 +104,9 @@ func (s *FleetSharedState) runAssignment(ctx context.Context) {
 	// Run assignment (in-memory, fast).
 	assigned, _, surplus := AssignVMsToNodeClaims(s.requests, vms, s.instanceTypes)
 	s.assignments = assigned
-	s.surplus = surplus
-}
-
-// runTaggingAndCleanup runs in the background after state has been distributed
-// to promises. It tags assigned VMs with nodeclaim-name and deletes surplus VMs.
-// Both operations are best-effort and not on the critical path for node registration.
-func (s *FleetSharedState) runTaggingAndCleanup(ctx context.Context) {
-	if s.err != nil {
-		return
-	}
-	s.tagAssignedVMs(ctx, s.assignments)
-	s.deleteSurplusVMs(ctx, s.surplus)
-}
-
-// tagAssignedVMs patches each assigned VM with the nodeclaim-name tag.
-// Tag failure is non-fatal: the VM is still delivered to the promise.
-// We merge the new tag into the VM's existing tags to avoid replacing them.
-func (s *FleetSharedState) tagAssignedVMs(ctx context.Context, assignments map[string]*FleetAssignment) {
-	if s.vmClient == nil {
-		return
-	}
-	for ncName, a := range assignments {
-		if a == nil || a.VM == nil || a.VM.Name == nil {
-			continue
-		}
-		// Merge: start with existing VM tags (inherited from Fleet), then add nodeclaim tag.
-		mergedTags := make(map[string]*string, len(a.VM.Tags)+1)
-		for k, v := range a.VM.Tags {
-			mergedTags[k] = v
-		}
-		mergedTags["karpenter.azure.com_nodeclaim-name"] = lo.ToPtr(ncName)
-
-		update := armcompute.VirtualMachineUpdate{Tags: mergedTags}
-		poller, err := s.vmClient.BeginUpdate(ctx, s.resourceGroup, *a.VM.Name, update, nil)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "failed to tag VM", "vm", *a.VM.Name, "nodeclaim", ncName)
-			continue
-		}
-		if poller == nil {
-			continue
-		}
-		// Fire-and-forget poll for POC; real implementation may batch these.
-		if _, err := poller.PollUntilDone(ctx, nil); err != nil {
-			log.FromContext(ctx).Error(err, "tag poll failed", "vm", *a.VM.Name, "nodeclaim", ncName)
-		}
-	}
-}
-
-// deleteSurplusVMs attempts to delete VMs that weren't matched to any request.
-// Best-effort: failures are logged but don't affect the batch result.
-func (s *FleetSharedState) deleteSurplusVMs(ctx context.Context, surplus []*armcompute.VirtualMachine) {
-	if s.vmClient == nil {
-		return
-	}
-	for _, vm := range surplus {
-		if vm == nil || vm.Name == nil {
-			continue
-		}
-		_, err := s.vmClient.BeginDelete(ctx, s.resourceGroup, *vm.Name, nil)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "failed to delete surplus VM", "vm", *vm.Name)
-		}
+	if len(surplus) > 0 {
+		log.FromContext(ctx).Info("fleet produced surplus VMs; leaving them for instance GC",
+			"fleet", s.fleetName, "surplusCount", len(surplus))
 	}
 }
 
@@ -174,7 +118,7 @@ func (s *FleetSharedState) GetAssignment(nodeClaimName string) *FleetAssignment 
 	return s.assignments[nodeClaimName]
 }
 
-// GetError returns the batch-wide error, or nil if the poll succeeded.
+// GetError returns the batch-wide error, or nil if the fleet create succeeded.
 func (s *FleetSharedState) GetError() error {
 	return s.err
 }

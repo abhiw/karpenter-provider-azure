@@ -34,6 +34,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/aksmachinesheaderbatch"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/fleet"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	imagefamilytypes "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/skuclient"
@@ -285,7 +286,12 @@ func NewAZClient(ctx context.Context, cfg *auth.Config, env *auth.Environment, c
 	// Create Fleet client if fleet mode is enabled
 	var fleetsClient *armcomputefleet.FleetsClient
 	if o.IsFleetMode() {
-		fleetsClient, err = armcomputefleet.NewFleetsClient(cfg.SubscriptionID, cred, opts)
+		// copy the options to avoid modifying the original; register the raw-properties
+		// policy that injects interconnectBlockProfile/networkProfile.interconnectGroupProfile
+		// (ARM properties not exposed as typed fields by armcomputefleet/v2, see rawproperties.go).
+		var fleetClientOptions = *opts
+		fleetClientOptions.PerCallPolicies = append(fleetClientOptions.PerCallPolicies, fleet.NewRawPropertiesPolicy())
+		fleetsClient, err = armcomputefleet.NewFleetsClient(cfg.SubscriptionID, cred, &fleetClientOptions)
 		if err != nil {
 			return nil, err
 		}

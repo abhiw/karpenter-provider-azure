@@ -19,71 +19,26 @@ package fleet
 import (
 	"context"
 	"fmt"
-	"sync"
 	"testing"
 
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
-// --- Mock VM API ---
-
-type updateCall struct {
-	ResourceGroup string
-	VMName        string
-	Tags          map[string]*string
-}
-
-type mockVMAPI struct {
-	updateCalls []updateCall
-	deleteCalls []string // VM names
-	updateErr   error
-	deleteErr   error
-	mu          sync.Mutex
-}
-
-func (m *mockVMAPI) BeginUpdate(_ context.Context, rg string, vmName string, params armcompute.VirtualMachineUpdate, _ *armcompute.VirtualMachinesClientBeginUpdateOptions) (*runtime.Poller[armcompute.VirtualMachinesClientUpdateResponse], error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.updateCalls = append(m.updateCalls, updateCall{ResourceGroup: rg, VMName: vmName, Tags: params.Tags})
-	if m.updateErr != nil {
-		return nil, m.updateErr
-	}
-	// Return nil poller — tagAssignedVMs handles nil poller by skipping PollUntilDone
-	return nil, nil
-}
-
-func (m *mockVMAPI) BeginDelete(_ context.Context, _ string, vmName string, _ *armcompute.VirtualMachinesClientBeginDeleteOptions) (*runtime.Poller[armcompute.VirtualMachinesClientDeleteResponse], error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.deleteCalls = append(m.deleteCalls, vmName)
-	if m.deleteErr != nil {
-		return nil, m.deleteErr
-	}
-	return nil, nil
-}
-
-func (m *mockVMAPI) NewListPager(_ string, _ *armcompute.VirtualMachinesClientListOptions) *runtime.Pager[armcompute.VirtualMachinesClientListResponse] {
-	// Not used in shared state tests; executor tests use a separate mock.
-	return nil
-}
-
 // --- Tests ---
 
-// TestFleetSharedState_SingleRunAssignment verifies that runAssignment + runTaggingAndCleanup
-// produces the expected assignment on a single call. With sync.Once removed,
-// the executor is the single caller — concurrent calls are no longer part of
-// the contract.
+// TestFleetSharedState_SingleRunAssignment verifies that runAssignment produces the
+// expected assignment on a single call. With sync.Once removed, the executor is the
+// single caller — concurrent calls are no longer part of the contract.
 func TestFleetSharedState_SingleRunAssignment(t *testing.T) {
 	g := NewWithT(t)
 
 	vmSize := armcompute.VirtualMachineSizeTypes("Standard_D4s_v3")
 	// Realistic ARM payload: numeric zone + region location. The matcher must
-	// convert these to AKS-label format ("westus-1") to match the request.
+	// convert these to AKS-label format ("westus-1") for the assignment record.
 	vm := &armcompute.VirtualMachine{
 		Name:     lo.ToPtr("vm-1"),
 		Location: lo.ToPtr("westus"),
@@ -103,7 +58,6 @@ func TestFleetSharedState_SingleRunAssignment(t *testing.T) {
 	)
 
 	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
 }
@@ -128,7 +82,6 @@ func TestFleetSharedState_AllRequestsAssigned(t *testing.T) {
 	)
 
 	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
@@ -155,88 +108,15 @@ func TestFleetSharedState_PartialAssignment(t *testing.T) {
 	)
 
 	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
 
 	g.Expect(state.GetError()).To(BeNil())
 	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil())
 	g.Expect(state.GetAssignment("nc-2")).To(BeNil()) // unmatched
 }
 
-// TestFleetSharedState_SurplusVMsDeleted verifies surplus VMs trigger BeginDelete calls.
-func TestFleetSharedState_SurplusVMsDeleted(t *testing.T) {
-	g := NewWithT(t)
-
-	mock := &mockVMAPI{}
-	state := NewFleetSharedStateForTest(
-		[]*armcompute.VirtualMachine{
-			mkVM("Standard_D4s_v3", "westus-1"),
-			mkVM("Standard_D8s_v3", "westus-2"), // surplus — no request for this
-		},
-		[]*VMAssignmentRequest{
-			{NodeClaimName: "nc-1", AcceptableSKUs: []string{"Standard_D4s_v3"}, AcceptableZones: []string{"westus-1"},
-				InstanceTypes: map[string]*cloudprovider.InstanceType{"Standard_D4s_v3": {Name: "Standard_D4s_v3"}}},
-		},
-		nil, mock, "fleet-test", "rg-test",
-	)
-
-	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
-
-	g.Expect(mock.deleteCalls).To(HaveLen(1))
-	g.Expect(mock.deleteCalls[0]).To(ContainSubstring("Standard_D8s_v3"))
-}
-
-// TestFleetSharedState_TaggingCalled verifies BeginUpdate is called once per assigned VM.
-func TestFleetSharedState_TaggingCalled(t *testing.T) {
-	g := NewWithT(t)
-
-	mock := &mockVMAPI{}
-	state := NewFleetSharedStateForTest(
-		[]*armcompute.VirtualMachine{
-			mkVM("Standard_D4s_v3", "westus-1"),
-		},
-		[]*VMAssignmentRequest{
-			{NodeClaimName: "nc-1", AcceptableSKUs: []string{"Standard_D4s_v3"}, AcceptableZones: []string{"westus-1"},
-				InstanceTypes: map[string]*cloudprovider.InstanceType{"Standard_D4s_v3": {Name: "Standard_D4s_v3"}}},
-		},
-		nil, mock, "fleet-test", "rg-test",
-	)
-
-	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
-
-	g.Expect(mock.updateCalls).To(HaveLen(1))
-	g.Expect(mock.updateCalls[0].Tags).To(HaveKey("karpenter.azure.com_nodeclaim-name"))
-	g.Expect(*mock.updateCalls[0].Tags["karpenter.azure.com_nodeclaim-name"]).To(Equal("nc-1"))
-}
-
-// TestFleetSharedState_TagFailureNonFatal verifies that if BeginUpdate returns error,
-// the assignment still appears in GetAssignment.
-func TestFleetSharedState_TagFailureNonFatal(t *testing.T) {
-	g := NewWithT(t)
-
-	mock := &mockVMAPI{updateErr: fmt.Errorf("tag failed")}
-	state := NewFleetSharedStateForTest(
-		[]*armcompute.VirtualMachine{
-			mkVM("Standard_D4s_v3", "westus-1"),
-		},
-		[]*VMAssignmentRequest{
-			{NodeClaimName: "nc-1", AcceptableSKUs: []string{"Standard_D4s_v3"}, AcceptableZones: []string{"westus-1"},
-				InstanceTypes: map[string]*cloudprovider.InstanceType{"Standard_D4s_v3": {Name: "Standard_D4s_v3"}}},
-		},
-		nil, mock, "fleet-test", "rg-test",
-	)
-
-	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
-
-	g.Expect(state.GetError()).To(BeNil())
-	g.Expect(state.GetAssignment("nc-1")).NotTo(BeNil()) // still assigned despite tag failure
-}
-
-// TestFleetSharedState_LROError verifies that when SetError is called before runAssignment + runTaggingAndCleanup,
-// GetError returns the error for all promises.
-func TestFleetSharedState_LROError(t *testing.T) {
+// TestFleetSharedState_CreateError verifies that when SetError is called before
+// runAssignment, GetError returns the error for all promises.
+func TestFleetSharedState_CreateError(t *testing.T) {
 	g := NewWithT(t)
 
 	state := NewFleetSharedStateForTest(
@@ -247,12 +127,11 @@ func TestFleetSharedState_LROError(t *testing.T) {
 		},
 		nil, nil, "fleet-test", "rg-test",
 	)
-	state.SetError(fmt.Errorf("LRO failed: fleet create timeout"))
+	state.SetError(fmt.Errorf("fleet create failed: timeout"))
 
 	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
 
-	g.Expect(state.GetError()).To(MatchError(ContainSubstring("LRO failed")))
+	g.Expect(state.GetError()).To(MatchError(ContainSubstring("fleet create failed")))
 	g.Expect(state.GetAssignment("nc-1")).To(BeNil())
 }
 
@@ -265,9 +144,7 @@ func TestFleetSharedState_EmptyBatch(t *testing.T) {
 	)
 
 	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
 
-	// With 0 requests and 0 VMs, no error but "no VMs available" since requests is nil
 	g.Expect(state.GetError()).To(BeNil())
 }
 
@@ -286,6 +163,5 @@ func TestFleetSharedState_GetAssignment_Unknown(t *testing.T) {
 	)
 
 	state.runAssignment(context.Background())
-	state.runTaggingAndCleanup(context.Background())
 	g.Expect(state.GetAssignment("nc-unknown")).To(BeNil())
 }

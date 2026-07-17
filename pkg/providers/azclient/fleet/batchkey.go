@@ -28,6 +28,7 @@ import (
 
 // BatchKeyFields contains all fields that determine batch grouping.
 // Requests with identical BatchKeyFields land in the same Fleet.
+// Used by BuildFleetBody to construct the Fleet PUT body.
 type BatchKeyFields struct {
 	NodePoolName        string
 	CapacityType        string
@@ -44,13 +45,23 @@ type BatchKeyFields struct {
 	NSG                 string
 	CandidateSKUs       []string // sorted alphabetically before hashing
 	Zones               []string // sorted alphabetically before hashing
+
+	// Interconnect topology fields (see FleetVMProvisionRequest). Requests targeting
+	// different interconnect placement MUST NOT share a Fleet, since a Fleet's
+	// interconnectBlockProfile/networkProfile.interconnectGroupProfile can only carry
+	// one configuration.
+	InterconnectBlockID    string
+	InterconnectGroupID    string
+	InterconnectSubgroupID string
 }
 
 // DetermineBatchKey computes a deterministic grouping key for a FleetVMProvisionRequest.
-// Two requests batch into the same Fleet iff every field on BatchKeyFields matches.
+// It builds the actual Fleet body with capacity=1 and hashes it, so the batch key
+// is a direct reflection of the Fleet PUT request. Two requests that produce identical
+// Fleet bodies (at capacity=1) will always batch together - no separate field list
+// to maintain or risk drifting from the Fleet body.
 //
-// Per-VM fields (Tags, NodeClaimName) are intentionally excluded — otherwise every
-// NodeClaim would land in its own Fleet and batching would be a no-op.
+// Per-VM fields (NodeClaimName) are not part of the Fleet body and do not affect the key.
 //
 // This is the batcher.DetermineBatchKey[FleetVMProvisionRequest] implementation.
 func DetermineBatchKey(req *FleetVMProvisionRequest) (string, error) {
@@ -58,7 +69,57 @@ func DetermineBatchKey(req *FleetVMProvisionRequest) (string, error) {
 		return "", fmt.Errorf("nil request, nodeclaim, nodeclass, or launch template")
 	}
 
-	fields := BatchKeyFields{
+	fields := extractBatchKeyFieldsFromRequest(req)
+
+	// Build the Fleet body with capacity=1. This is the canonical representation
+	// of a single-VM Fleet request. Requests that produce the same body at capacity=1
+	// are compatible and can share a Fleet at capacity=N.
+	fleetBody := BuildFleetBody(
+		fields,
+		1, // capacity=1: constant across all requests
+		req.Tags,
+		nil, // spotMaxPrice: nil = default (-1)
+		req.Location,
+		req.LBBackendPools,
+		req.InstanceTypes,
+		false, // useSIG
+		req.Extensions,
+	)
+
+	// The Fleet body does not include interconnect fields (they are injected via a
+	// raw JSON patch on the request context, not expressed in the typed SDK struct).
+	// Wrap the body with interconnect fields so they are included in the hash.
+	hashInput := struct {
+		Fleet                  interface{} `json:"fleet"`
+		InterconnectBlockID    string      `json:"interconnectBlockID,omitempty"`
+		InterconnectGroupID    string      `json:"interconnectGroupID,omitempty"`
+		InterconnectSubgroupID string      `json:"interconnectSubgroupID,omitempty"`
+	}{
+		Fleet:                  fleetBody,
+		InterconnectBlockID:    req.InterconnectBlockID,
+		InterconnectGroupID:    req.InterconnectGroupID,
+		InterconnectSubgroupID: req.InterconnectSubgroupID,
+	}
+
+	blob, err := json.Marshal(hashInput)
+	if err != nil {
+		return "", fmt.Errorf("marshal fleet body for batch key: %w", err)
+	}
+
+	sum := sha256.Sum256(blob)
+
+	nodePoolName := req.NodeClaim.Labels[karpv1.NodePoolLabelKey]
+	capacityType := req.CapacityType
+
+	// Prefix with nodepool + capacityType so logs/metrics can tell batches apart at a glance,
+	// mirroring the aksmachinesheaderbatch convention.
+	return fmt.Sprintf("%s/%s/%x", nodePoolName, capacityType, sum[:8]), nil
+}
+
+// extractBatchKeyFieldsFromRequest builds BatchKeyFields from a FleetVMProvisionRequest.
+// Used by DetermineBatchKey and by the executor (via extractBatchKeyFields).
+func extractBatchKeyFieldsFromRequest(req *FleetVMProvisionRequest) BatchKeyFields {
+	return BatchKeyFields{
 		NodePoolName:  req.NodeClaim.Labels[karpv1.NodePoolLabelKey],
 		CapacityType:  req.CapacityType,
 		ImageID:       req.LaunchTemplate.ImageID,
@@ -67,21 +128,7 @@ func DetermineBatchKey(req *FleetVMProvisionRequest) (string, error) {
 		AdminUsername: req.AdminUsername,
 		CustomData:    req.LaunchTemplate.ScriptlessCustomData,
 		OSDiskSizeGB:  int(req.LaunchTemplate.StorageProfileSizeGB),
-
-		// OSDiskType is sourced from StorageProfilePlacement (the DiffDiskPlacement enum:
-		// "CacheDisk" / "ResourceDisk" / "NvmeDisk", or "" when the disk is managed).
-		//
-		// This is the field that actually lands in the Fleet body's storageProfile, so the
-		// hash directly reflects "can these requests share one Fleet?".
-		//
-		// Alternatives considered and rejected:
-		//   (A) StorageProfileIsEphemeral bool — too coarse: two requests that both resolve
-		//       to ephemeral but with different placements (e.g. CacheDisk vs NvmeDisk)
-		//       would erroneously batch together; the Fleet body can only carry one
-		//       placement, so the second request would silently get the first's choice.
-		//   (C) Hash both IsEphemeral AND Placement — redundant. The boolean is derivable
-		//       from placement ("" == managed, non-empty == ephemeral).
-		OSDiskType: string(req.LaunchTemplate.StorageProfilePlacement),
+		OSDiskType:    string(req.LaunchTemplate.StorageProfilePlacement),
 
 		EncryptionAtHost:    req.NodeClass.GetEncryptionAtHost(),
 		DiskEncryptionSetID: req.DiskEncryptionSetID,
@@ -89,18 +136,11 @@ func DetermineBatchKey(req *FleetVMProvisionRequest) (string, error) {
 		NSG:                 req.NSG,
 		CandidateSKUs:       sortedCopy(req.AcceptableSKUs),
 		Zones:               sortedCopy(req.AcceptableZones),
+
+		InterconnectBlockID:    req.InterconnectBlockID,
+		InterconnectGroupID:    req.InterconnectGroupID,
+		InterconnectSubgroupID: req.InterconnectSubgroupID,
 	}
-
-	blob, err := json.Marshal(fields)
-	if err != nil {
-		return "", fmt.Errorf("marshal batch key: %w", err)
-	}
-
-	sum := sha256.Sum256(blob)
-
-	// Prefix with nodepool + capacityType so logs/metrics can tell batches apart at a glance,
-	// mirroring the aksmachinesheaderbatch convention.
-	return fmt.Sprintf("%s/%s/%x", fields.NodePoolName, fields.CapacityType, sum[:8]), nil
 }
 
 func sortedCopy(in []string) []string {

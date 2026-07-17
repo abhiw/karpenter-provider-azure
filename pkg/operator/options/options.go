@@ -100,9 +100,8 @@ type Options struct {
 	BatchMaxTimeoutMS   int    `json:"batchMaxTimeoutMS,omitempty"`   // Maximum timeout in milliseconds for batch accumulation (default 5000ms). Only used on provision mode aksmachineapiheaderbatch.
 	MaxBatchSize        int    `json:"maxBatchSize,omitempty"`        // Maximum number of machines per batch (default 50, AKS API limit). Only used on provision mode aksmachineapiheaderbatch.
 
-	// Fleet per-VM GC tunables (only used when ProvisionMode is fleet).
-	FleetVMGCInterval    time.Duration `json:"fleetVMGCInterval,omitempty"`    // Reconcile cadence for the per-VM Fleet GC.
-	FleetVMGCGracePeriod time.Duration `json:"fleetVMGCGracePeriod,omitempty"` // Minimum age a Fleet VM must reach (without a nodeclaim-name tag) before GC will delete it.
+	// Fleet tagging tunable (only used when ProvisionMode is fleet).
+	FleetTagInterval time.Duration `json:"fleetTagInterval,omitempty"` // Reconcile cadence for the Fleet VM tagging controller.
 
 	// computed options; do not set.
 	ParsedDiskEncryptionSetID *arm.ResourceID `json:"-"`
@@ -136,8 +135,7 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.IntVar(&o.BatchIdleTimeoutMS, "batch-idle-timeout-ms", env.WithDefaultInt("BATCH_IDLE_TIMEOUT_MS", 1000), "Idle timeout in milliseconds for batch accumulation. Only used on provision mode aksmachineapiheaderbatch.")
 	fs.IntVar(&o.BatchMaxTimeoutMS, "batch-max-timeout-ms", env.WithDefaultInt("BATCH_MAX_TIMEOUT_MS", 5000), "Maximum timeout in milliseconds for batch accumulation. Only used on provision mode aksmachineapiheaderbatch.")
 	fs.IntVar(&o.MaxBatchSize, "max-batch-size", env.WithDefaultInt("MAX_BATCH_SIZE", consts.AKSMachineAPIHeaderBatchMaxSize), fmt.Sprintf("Maximum number of machines per batch (AKS API limit is %d). Only used on provision mode aksmachineapiheaderbatch.", consts.AKSMachineAPIHeaderBatchMaxSize))
-	fs.DurationVar(&o.FleetVMGCInterval, "fleet-vm-gc-interval", env.WithDefaultDuration("FLEET_VM_GC_INTERVAL", 5*time.Minute), "Reconcile cadence for the per-VM Fleet garbage collector. Only used when PROVISION_MODE is fleet.")
-	fs.DurationVar(&o.FleetVMGCGracePeriod, "fleet-vm-gc-grace-period", env.WithDefaultDuration("FLEET_VM_GC_GRACE_PERIOD", 15*time.Minute), "Minimum age a Fleet-provisioned VM must reach before the per-VM Fleet garbage collector will treat it as an orphan. Only used when PROVISION_MODE is fleet.")
+	fs.DurationVar(&o.FleetTagInterval, "fleet-tag-interval", env.WithDefaultDuration("FLEET_TAG_INTERVAL", 1*time.Minute), "Reconcile cadence for the Fleet VM tagging controller. Only used when PROVISION_MODE is fleet.")
 
 	additionalTagsFlag := k8sflag.NewMapStringString(&o.AdditionalTags)
 	if err := additionalTagsFlag.Set(env.WithDefaultString("ADDITIONAL_TAGS", "")); err != nil {

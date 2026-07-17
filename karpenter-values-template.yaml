@@ -58,10 +58,8 @@ controller:
       value: "${AKS_MACHINES_POOL_NAME}"
     - name: ARM_RESOURCE_GROUP
       value: "${AZURE_RESOURCE_GROUP}"
-    - name: FLEET_VM_GC_INTERVAL
-      value: "${FLEET_VM_GC_INTERVAL:-5m}"
-    - name: FLEET_VM_GC_GRACE_PERIOD
-      value: "${FLEET_VM_GC_GRACE_PERIOD:-15m}"
+    - name: FLEET_TAG_INTERVAL
+      value: "${FLEET_TAG_INTERVAL:-1m}"
 serviceAccount:
   name: ${KARPENTER_SERVICE_ACCOUNT_NAME}
   annotations:

@@ -100,7 +100,7 @@ func main() {
 			options.FromContext(ctx).ParsedDiskEncryptionSetID,
 			options.FromContext(ctx).NetworkPolicy,
 			options.FromContext(ctx).NetworkPlugin,
-			op.AZClient.FleetsClient(),
+			op.AZClient.VirtualMachinesClient(),
 		)...).
 		Start(ctx)
 }

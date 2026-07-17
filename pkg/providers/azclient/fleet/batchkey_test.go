@@ -103,6 +103,9 @@ func withEncryptionAtHost(v bool) func(*FleetVMProvisionRequest) {
 		r.NodeClass.Spec.Security.EncryptionAtHost = &v
 	}
 }
+func withInterconnectGroupID(id string) func(*FleetVMProvisionRequest) {
+	return func(r *FleetVMProvisionRequest) { r.InterconnectGroupID = id }
+}
 
 func mustKey(t *testing.T, req *FleetVMProvisionRequest) string {
 	t.Helper()
@@ -125,21 +128,23 @@ func TestDetermineBatchKey_EqualityOnIdenticalFields(t *testing.T) {
 	g.Expect(a).To(gomega.Equal(b))
 }
 
-// TestDetermineBatchKey_TagsIgnored verifies that Tags are per-VM metadata and
-// must not influence the batch key. If they did, every NodeClaim (which carries
-// its own nodeclaim-name tag) would land in its own Fleet and batching would be
-// a no-op. Covers: tag with different value, tag with extra key, and nil tags.
-func TestDetermineBatchKey_TagsIgnored(t *testing.T) {
+// TestDetermineBatchKey_TagsAffectKey verifies that tags are part of the Fleet body
+// and therefore affect the batch key. Tags come from nodepool/nodeclass config
+// (cluster name, billing, nodepool label, user-specified tags), not per-NodeClaim
+// data, so different tag sets mean different Fleet configurations.
+func TestDetermineBatchKey_TagsAffectKey(t *testing.T) {
 	t.Parallel()
 	g := gomega.NewWithT(t)
 
 	v1 := "x"
 	v2 := "y"
 	a := mustKey(t, mkReq(withTags(map[string]*string{"k1": &v1})))
-	b := mustKey(t, mkReq(withTags(map[string]*string{"k1": &v2, "k2": &v1})))
-	c := mustKey(t, mkReq(withTags(nil)))
-	g.Expect(a).To(gomega.Equal(b))
-	g.Expect(a).To(gomega.Equal(c))
+	b := mustKey(t, mkReq(withTags(map[string]*string{"k1": &v2})))
+	g.Expect(a).ToNot(gomega.Equal(b), "different tag values should produce different keys")
+
+	// Same tags in same order should produce same key
+	c := mustKey(t, mkReq(withTags(map[string]*string{"k1": &v1})))
+	g.Expect(a).To(gomega.Equal(c), "identical tags should produce same key")
 }
 
 // TestDetermineBatchKey_NodeClaimNameIgnored verifies that NodeClaimName is
@@ -231,11 +236,36 @@ func TestDetermineBatchKey_DifferentEncryptionAtHostFlipsKey(t *testing.T) {
 	g.Expect(a).ToNot(gomega.Equal(b))
 }
 
+// TestDetermineBatchKey_DifferentInterconnectGroupIDFlipsKey verifies that two
+// requests targeting different InterconnectGroupID values cannot share a Fleet.
+// A Fleet's networkProfile.interconnectGroupProfile is single-valued, so requests
+// wanting different interconnect placement must batch separately (spec EC-003/AC-005).
+func TestDetermineBatchKey_DifferentInterconnectGroupIDFlipsKey(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	a := mustKey(t, mkReq(withInterconnectGroupID("/subscriptions/sub/.../interconnectGroups/icg-1")))
+	b := mustKey(t, mkReq(withInterconnectGroupID("/subscriptions/sub/.../interconnectGroups/icg-2")))
+	g.Expect(a).ToNot(gomega.Equal(b))
+}
+
+// TestDetermineBatchKey_UnsetInterconnectFieldsMatchEmptyDefault verifies that a
+// request with InterconnectGroupID explicitly set to "" batches the same as one
+// where the field was simply left unset (the zero value), preserving backward
+// compatibility for existing Fleet NodePools that don't use interconnect placement.
+func TestDetermineBatchKey_UnsetInterconnectFieldsMatchEmptyDefault(t *testing.T) {
+	t.Parallel()
+	g := gomega.NewWithT(t)
+
+	a := mustKey(t, mkReq())
+	b := mustKey(t, mkReq(withInterconnectGroupID("")))
+	g.Expect(a).To(gomega.Equal(b))
+}
+
 // TestDetermineBatchKey_NilRequestReturnsError verifies the nil-safety contract:
 // a nil request must produce a non-nil error rather than panic or return an empty
 // key. The batcher wraps this error and surfaces it to the caller of Enqueue.
-func TestDetermineBatchKey_NilRequestReturnsError(t *testing.T) {
-	t.Parallel()
+func TestDetermineBatchKey_NilRequestReturnsError(t *testing.T) {	t.Parallel()
 	g := gomega.NewWithT(t)
 
 	_, err := DetermineBatchKey(nil)

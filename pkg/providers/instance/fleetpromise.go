@@ -21,9 +21,14 @@ import (
 	"fmt"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/samber/lo"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/fleet"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/fleetvmpoller"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance/offerings"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
@@ -37,6 +42,15 @@ type FleetMemberPromise struct {
 	fleetName     string
 	vmProvider    VMProvider
 
+	// Fields for GET-based provisioning state polling and error handling.
+	// These are plumbed from DefaultFleetProvider.BeginCreate() at construction.
+	ctx                  context.Context
+	vmClient             fleet.VMAPI
+	resourceGroup        string
+	errorHandling        *offerings.ResponseErrorHandler
+	instanceTypeProvider instancetype.Provider
+	pollerOptions        *fleetvmpoller.Options // nil means use DefaultOptions()
+
 	// Populated after Wait() completes successfully
 	VM           *armcompute.VirtualMachine
 	InstanceType *cloudprovider.InstanceType
@@ -48,12 +62,12 @@ type FleetMemberPromise struct {
 // Ensure FleetMemberPromise implements Promise.
 var _ Promise = (*FleetMemberPromise)(nil)
 
-// Wait blocks until the fleet batch completes and a VM is assigned to this NodeClaim.
-// Returns InsufficientCapacityError if no VM was assigned.
+// Wait blocks until the fleet batch completes, a VM is assigned to this NodeClaim,
+// and the VM's provisioningState reaches a terminal state (Succeeded or Failed).
 //
-// All SDK work (assignment, tagging, surplus deletion) is performed by the executor
-// before this state is handed to the promise, so Wait() is a pure read — no ctx
-// is required, no sync.Once is needed.
+// If the VM reaches Failed, Wait invokes the error handler to mark offerings as
+// unavailable in the cache (same pattern as SI VM's WaitFunc closure) and returns
+// an error so the background goroutine triggers cleanup.
 func (p *FleetMemberPromise) Wait() error {
 	if err := p.sharedState.GetError(); err != nil {
 		return err
@@ -65,15 +79,81 @@ func (p *FleetMemberPromise) Wait() error {
 			fmt.Errorf("no VM assigned for NodeClaim %s in fleet %s", p.nodeClaimName, p.fleetName))
 	}
 
-	p.VM = assignment.VM
 	p.InstanceType = assignment.InstanceType
 	p.Zone = assignment.Zone
+
+	// The assignment carries a minimal VM (ID, Name, VMSize, Zone, ProvisioningState)
+	// from listFleetVMs. We need to poll until provisioningState is terminal.
+	vmName := lo.FromPtr(assignment.VM.Name)
+	if vmName == "" {
+		return fmt.Errorf("fleet assignment for NodeClaim %s has no VM name", p.nodeClaimName)
+	}
+
+	// Poll compute GET until provisioningState reaches Succeeded or Failed.
+	vm, pollErr := p.pollVMProvisioning(vmName)
+	if pollErr != nil {
+		p.handleFailedProvisioning(pollErr)
+		return pollErr
+	}
+
+	// Provisioning succeeded - populate promise with the full VM object.
+	p.VM = vm
 	if p.VM != nil && p.VM.ID != nil {
-		// Match the canonical NodeClaim ProviderID shape (azure:// prefix, lowercase RG)
-		// so downstream consumers (e.g. CloudProvider.Delete → GetVMName) can parse it.
-		p.ProviderID = utils.VMResourceIDToProviderID(context.TODO(), *p.VM.ID)
+		p.ProviderID = utils.VMResourceIDToProviderID(p.ctx, *p.VM.ID)
 	}
 	return nil
+}
+
+// pollVMProvisioning polls GET /virtualMachines/{name} until provisioningState is terminal.
+// Uses the same polling pattern as aksmachinepoller (5s interval, exponential backoff).
+func (p *FleetMemberPromise) pollVMProvisioning(vmName string) (*armcompute.VirtualMachine, error) {
+	if p.vmClient == nil || p.ctx == nil {
+		// Legacy/test path without polling dependencies - fall back to assignment VM as-is.
+		assignment := p.sharedState.GetAssignment(p.nodeClaimName)
+		if assignment != nil && assignment.VM != nil {
+			return assignment.VM, nil
+		}
+		return nil, fmt.Errorf("no VM client available to poll fleet VM %q", vmName)
+	}
+
+	opts := fleetvmpoller.DefaultOptions()
+	if p.pollerOptions != nil {
+		opts = *p.pollerOptions
+	}
+	poller := fleetvmpoller.NewPoller(opts, p.vmClient, p.resourceGroup, vmName)
+	return poller.PollUntilDone(p.ctx)
+}
+
+// handleFailedProvisioning invokes the error handler to mark offerings as unavailable
+// in the cache. This is the Fleet equivalent of SI VM's error handling in the WaitFunc
+// closure (vminstance.go:891-900).
+func (p *FleetMemberPromise) handleFailedProvisioning(pollErr error) {
+	if p.errorHandling == nil || p.instanceTypeProvider == nil || p.InstanceType == nil {
+		return
+	}
+
+	ctx := p.ctx
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+
+	sku, err := p.instanceTypeProvider.Get(ctx, p.InstanceType.Name)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to resolve SKU for failed fleet VM",
+			"sku", p.InstanceType.Name, "nodeClaimName", p.nodeClaimName)
+		return
+	}
+
+	// Feed the error to the same handler chain used by SI VM.
+	handledErr := p.errorHandling.Handle(ctx, sku, p.InstanceType, p.Zone, p.capacityType, pollErr)
+	if handledErr != nil {
+		log.FromContext(ctx).Info("fleet VM provisioning failure handled, offerings marked unavailable",
+			"nodeClaimName", p.nodeClaimName, "sku", p.InstanceType.Name,
+			"zone", p.Zone, "capacityType", p.capacityType)
+	} else {
+		log.FromContext(ctx).Info("fleet VM provisioning failed with unhandled error code",
+			"nodeClaimName", p.nodeClaimName, "error", pollErr.Error())
+	}
 }
 
 // Cleanup deletes the assigned VM if one exists. No-op if Wait() wasn't called or no VM was assigned.

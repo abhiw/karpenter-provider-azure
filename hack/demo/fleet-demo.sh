@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fleet Launch Mode Demo — Provisions 10 nodes via Karpenter Fleet batching
 # Usage: ./hack/demo/fleet-demo.sh [step]
-#   Steps: setup | deploy | provision | observe | cleanup | all (default: all)
+#   Steps: setup | deploy | provision | interconnect | observe | cleanup | all (default: all)
 set -euo pipefail
 
 ###############################################################################
@@ -18,6 +18,16 @@ export KARPENTER_MSI_NAME="${KARPENTER_MSI_NAME:-karpentermsi}"
 export KARPENTER_SA_NAME="${KARPENTER_SA_NAME:-karpenter-sa}"
 export PROVISION_MODE="fleet"
 export DEMO_REPLICAS="${DEMO_REPLICAS:-100}"
+export LOG_LEVEL="${LOG_LEVEL:-debug}"
+
+# Interconnect demo parameters (Fleet-only). These are placeholder ARM resource IDs —
+# real values must be supplied by the caller before running `step_provision_interconnect`
+# (see hack/demo/fleet-demo.sh interconnect). VM size defaults to the GPU SKU this
+# feature targets; override via AZURE_GPU_VM_SIZE if needed for testing.
+export AZURE_INTERCONNECT_BLOCK_ID="${AZURE_INTERCONNECT_BLOCK_ID:-}"
+export AZURE_INTERCONNECT_GROUP_ID="${AZURE_INTERCONNECT_GROUP_ID:-}"
+export AZURE_INTERCONNECT_SUBGROUP_ID="${AZURE_INTERCONNECT_SUBGROUP_ID:-}"
+export AZURE_GPU_VM_SIZE="${AZURE_GPU_VM_SIZE:-Standard_ND128isr_GB300_v6}"
 
 # Build settings (WSL)
 export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$PATH"
@@ -37,6 +47,44 @@ ok()    { echo -e "\033[1;32m[OK]\033[0m    $*"; }
 err()   { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; }
 wait_msg() { echo -e "\033[1;33m[WAIT]\033[0m  $*"; }
 header(){ echo -e "\n\033[1;36m══════════════════════════════════════════════════════\033[0m"; echo -e "\033[1;36m  $*\033[0m"; echo -e "\033[1;36m══════════════════════════════════════════════════════\033[0m\n"; }
+
+# apply_zone_placement_policy_any patches the AKS cluster's default agent pool with a
+# speculative, undocumented "placement.zonePlacementPolicy": "Any" property via a raw
+# ARM GET+PUT (no CLI flag or documented ARM property exists for this — see the caller's
+# comment in step_setup for details). Best-effort only: failures are logged and ignored
+# so they never block the rest of the demo.
+apply_zone_placement_policy_any() {
+    local api_version="2025-08-01"
+    local pool_name
+    pool_name=$(az aks nodepool list \
+        --cluster-name "$AZURE_CLUSTER_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --query "[0].name" -o tsv 2>/dev/null) || true
+    if [[ -z "${pool_name:-}" ]]; then
+        info "Skipping speculative zonePlacementPolicy patch: could not resolve default node pool name."
+        return 0
+    fi
+
+    local pool_id="/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${AZURE_CLUSTER_NAME}/agentPools/${pool_name}"
+
+    info "Attempting speculative 'placement.zonePlacementPolicy: Any' patch on agent pool '$pool_name' (undocumented property, may be ignored/rejected by the API)..."
+    local current
+    if ! current=$(az rest --method get --url "https://management.azure.com${pool_id}?api-version=${api_version}" 2>/dev/null); then
+        info "Skipping speculative zonePlacementPolicy patch: failed to fetch current agent pool state."
+        return 0
+    fi
+
+    local patched
+    patched=$(echo "$current" | jq '.properties.placement = {"zonePlacementPolicy": "Any"}')
+
+    if az rest --method put \
+        --url "https://management.azure.com${pool_id}?api-version=${api_version}" \
+        --body "$patched" --output none 2>/dev/null; then
+        ok "Speculative zonePlacementPolicy patch accepted by the API."
+    else
+        info "Speculative zonePlacementPolicy patch was rejected or ignored by the API (expected, since it is undocumented) — continuing."
+    fi
+}
 
 ###############################################################################
 # Step 1: Setup — Cluster creation & infrastructure
@@ -98,6 +146,18 @@ step_setup() {
     else
         info "Cluster already exists, skipping creation."
     fi
+
+    # zonePlacementPolicy: Any (speculative)
+    # NOTE: "placement.zonePlacementPolicy" is NOT a documented property of
+    # Microsoft.ContainerService/managedClusters/agentPools in any published ARM API
+    # version (verified against the ARM schema reference up to 2026-04-02-preview,
+    # where only "availabilityZones" exists for zone selection). No az CLI flag exists
+    # for it either (checked `az aks create --help` / `az aks nodepool add --help`,
+    # with and without the aks-preview extension). This block is added purely at the
+    # user's explicit request as a best-effort/speculative raw ARM PATCH — it is
+    # expected to be silently ignored or rejected by the API and is NOT required by
+    # the Fleet interconnect feature itself (see spec-design-fleet-interconnect-vmsize-params.md §12).
+    apply_zone_placement_policy_any
 
     # Get credentials
     echo ""
@@ -552,6 +612,150 @@ EOF
 }
 
 ###############################################################################
+# Step 3b: Provision a single GPU node exercising interconnect placement fields
+###############################################################################
+step_provision_interconnect() {
+    header "Step 3b: Provision GPU Node with Interconnect Placement (Fleet-only)"
+    echo "This step applies an AKSNodeClass + NodePool exercising the 3 new interconnect"
+    echo "fields (interconnectBlockID, interconnectGroupID, interconnectSubgroupID) and a"
+    echo "sku-name requirement pinned to \$AZURE_GPU_VM_SIZE ($AZURE_GPU_VM_SIZE)."
+    echo ""
+    echo "The 3 interconnect fields are set from AZURE_INTERCONNECT_BLOCK_ID /"
+    echo "AZURE_INTERCONNECT_GROUP_ID / AZURE_INTERCONNECT_SUBGROUP_ID env vars."
+    echo "These MUST be real ARM resource IDs supplied by the caller — this step will"
+    echo "refuse to run with them unset, since empty values would produce a NodeClass"
+    echo "that is indistinguishable from one that doesn't use this feature at all."
+    echo ""
+    cd "$REPO_DIR"
+
+    if [[ -z "$AZURE_INTERCONNECT_BLOCK_ID" || -z "$AZURE_INTERCONNECT_GROUP_ID" || -z "$AZURE_INTERCONNECT_SUBGROUP_ID" ]]; then
+        err "AZURE_INTERCONNECT_BLOCK_ID, AZURE_INTERCONNECT_GROUP_ID, and AZURE_INTERCONNECT_SUBGROUP_ID must all be set."
+        echo "  Example:"
+        echo "    export AZURE_INTERCONNECT_BLOCK_ID=/subscriptions/.../interconnectBlocks/<name>"
+        echo "    export AZURE_INTERCONNECT_GROUP_ID=/subscriptions/.../interconnectGroups/<name>"
+        echo "    export AZURE_INTERCONNECT_SUBGROUP_ID=/subscriptions/.../interconnectGroups/<name>/subgroups/<name>"
+        echo "    ./hack/demo/fleet-demo.sh interconnect"
+        exit 1
+    fi
+
+    info "Applying AKSNodeClass 'gpu-interconnect'..."
+    kubectl apply -f - <<EOF
+apiVersion: karpenter.azure.com/v1beta1
+kind: AKSNodeClass
+metadata:
+  name: gpu-interconnect
+  annotations:
+    kubernetes.io/description: "Fleet demo — GPU nodes pinned to an interconnect topology"
+spec:
+  imageFamily: Ubuntu2204
+  interconnectBlockID: "${AZURE_INTERCONNECT_BLOCK_ID}"
+  interconnectGroupID: "${AZURE_INTERCONNECT_GROUP_ID}"
+  interconnectSubgroupID: "${AZURE_INTERCONNECT_SUBGROUP_ID}"
+EOF
+    ok "AKSNodeClass 'gpu-interconnect' applied."
+
+    info "Applying NodePool 'fleet-gpu-interconnect' (sku-name=${AZURE_GPU_VM_SIZE})..."
+    kubectl apply -f - <<EOF
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: fleet-gpu-interconnect
+  annotations:
+    kubernetes.io/description: "Fleet demo NodePool for GPU interconnect placement"
+spec:
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: Never
+    budgets:
+      - nodes: "0"
+  limits:
+    cpu: "2000"
+    memory: 4000Gi
+  template:
+    metadata:
+      labels:
+        kubernetes.azure.com/ebpf-dataplane: cilium
+        demo: fleet-interconnect
+    spec:
+      expireAfter: Never
+      startupTaints:
+        - key: node.cilium.io/agent-not-ready
+          effect: NoExecute
+          value: "true"
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: karpenter.azure.com/sku-name
+          operator: In
+          values: ["${AZURE_GPU_VM_SIZE}"]
+      nodeClassRef:
+        group: karpenter.azure.com
+        kind: AKSNodeClass
+        name: gpu-interconnect
+EOF
+    ok "NodePool 'fleet-gpu-interconnect' applied."
+
+    info "Deploying 1 pod to trigger 1 GPU node..."
+    kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-inflate-gpu-interconnect
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fleet-inflate-gpu-interconnect
+  template:
+    metadata:
+      labels:
+        app: fleet-inflate-gpu-interconnect
+        demo: fleet-interconnect
+    spec:
+      nodeSelector:
+        karpenter.azure.com/sku-name: "${AZURE_GPU_VM_SIZE}"
+      tolerations:
+        - key: node.cilium.io/agent-not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 120
+      containers:
+        - name: pause
+          image: mcr.microsoft.com/oss/kubernetes/pause:3.6
+          resources:
+            requests:
+              cpu: "1"
+              memory: 256Mi
+EOF
+    ok "Deployment applied."
+
+    echo ""
+    wait_msg "Waiting up to 10 minutes for the NodeClaim to become Ready..."
+    if kubectl wait nodeclaim -l karpenter.sh/nodepool=fleet-gpu-interconnect \
+        --for=condition=Ready --timeout=600s 2>/dev/null; then
+        ok "GPU interconnect NodeClaim is Ready."
+    else
+        err "Timed out waiting for the GPU interconnect NodeClaim to become Ready."
+    fi
+
+    echo ""
+    info "NodeClaim status:"
+    kubectl get nodeclaims -l karpenter.sh/nodepool=fleet-gpu-interconnect -o wide
+    echo ""
+    info "To verify the Fleet resource body includes the interconnect properties, run:"
+    echo "  ./hack/demo/fleet-demo.sh observe"
+    echo "  (then inspect the saved Fleet PUT body for interconnectBlockProfile / networkProfile.interconnectGroupProfile)"
+}
+
+###############################################################################
 # Step 4: Observe — Fleet resources & request bodies
 ###############################################################################
 step_observe() {
@@ -675,7 +879,7 @@ step_cleanup() {
     info "Deleting Kubernetes resources (deployments, nodepools, nodeclass)..."
     kubectl delete deployments --all -n default --ignore-not-found
     kubectl delete nodepools --all --ignore-not-found
-    kubectl delete aksnodeclasses default --ignore-not-found
+    kubectl delete aksnodeclasses default gpu-interconnect --ignore-not-found
     ok "Kubernetes resources deleted."
 
     echo ""
@@ -705,6 +909,24 @@ step_cleanup() {
         ELAPSED=$((ELAPSED + 10))
     done
 
+    # Delete Fleet resources in the node resource group
+    echo ""
+    info "Deleting Fleet resources in '$AZURE_NODE_RESOURCE_GROUP'..."
+    FLEET_NAMES=$(az rest --method GET \
+        --url "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_NODE_RESOURCE_GROUP}/providers/Microsoft.AzureFleet/fleets?api-version=2024-11-01" \
+        --query "value[].name" -o tsv 2>/dev/null || echo "")
+    if [[ -n "$FLEET_NAMES" ]]; then
+        echo "$FLEET_NAMES" | while read -r FLEET_NAME; do
+            info "  Deleting fleet: $FLEET_NAME"
+            az rest --method DELETE \
+                --url "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_NODE_RESOURCE_GROUP}/providers/Microsoft.AzureFleet/fleets/${FLEET_NAME}?api-version=2024-11-01" \
+                2>/dev/null || true
+        done
+        ok "Fleet resources deleted."
+    else
+        info "No Fleet resources found."
+    fi
+
     ok "Cleanup complete. All demo resources removed."
 }
 
@@ -714,11 +936,12 @@ step_cleanup() {
 STEP="${1:-all}"
 
 case "$STEP" in
-    setup)     step_setup ;;
-    deploy)    step_deploy ;;
-    provision) step_provision ;;
-    observe)   step_observe ;;
-    cleanup)   step_cleanup ;;
+    setup)        step_setup ;;
+    deploy)       step_deploy ;;
+    provision)    step_provision ;;
+    interconnect) step_provision_interconnect ;;
+    observe)      step_observe ;;
+    cleanup)      step_cleanup ;;
     all)
         step_setup
         step_deploy
@@ -726,15 +949,17 @@ case "$STEP" in
         step_observe
         ;;
     *)
-        echo "Usage: $0 {setup|deploy|provision|observe|cleanup|all}"
+        echo "Usage: $0 {setup|deploy|provision|interconnect|observe|cleanup|all}"
         echo ""
         echo "Steps:"
-        echo "  setup      Create Azure infra (RG, MSI, ACR, AKS, roles)"
-        echo "  deploy     Build Karpenter image and deploy with PROVISION_MODE=fleet"
-        echo "  provision  Apply NodePool + workload to trigger 10 Fleet-provisioned nodes"
-        echo "  observe    Query Fleet resources, save request bodies, show VM details"
-        echo "  cleanup    Remove workload and nodes"
-        echo "  all        Run setup → deploy → provision → observe (no cleanup)"
+        echo "  setup        Create Azure infra (RG, MSI, ACR, AKS, roles)"
+        echo "  deploy       Build Karpenter image and deploy with PROVISION_MODE=fleet"
+        echo "  provision    Apply NodePool + workload to trigger 10 Fleet-provisioned nodes"
+        echo "  interconnect Apply a GPU NodePool exercising interconnectBlockID/GroupID/SubgroupID"
+        echo "               (requires AZURE_INTERCONNECT_BLOCK_ID/GROUP_ID/SUBGROUP_ID env vars)"
+        echo "  observe      Query Fleet resources, save request bodies, show VM details"
+        echo "  cleanup      Remove workload and nodes"
+        echo "  all          Run setup → deploy → provision → observe (no cleanup)"
         exit 1
         ;;
 esac
