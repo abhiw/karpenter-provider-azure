@@ -204,6 +204,7 @@ func TestFleetMemberPromise_Wait_StampsProviderID(t *testing.T) {
 		fleetName:     "fleet-test",
 	}
 
+	g.Expect(p.ResolveAssignment()).To(Succeed())
 	g.Expect(p.Wait()).To(Succeed())
 	g.Expect(p.VM).NotTo(BeNil())
 	g.Expect(p.ProviderID).To(HavePrefix("azure://"))
@@ -211,10 +212,10 @@ func TestFleetMemberPromise_Wait_StampsProviderID(t *testing.T) {
 	g.Expect(p.ProviderID).To(ContainSubstring("/resourceGroups/mc_rg/"))
 }
 
-// TestFleetMemberPromise_Wait_UnassignedReturnsInsufficientCapacity covers the
+// TestFleetMemberPromise_ResolveAssignment_UnassignedReturnsInsufficientCapacity covers the
 // case where the assignment didn't match — CloudProvider.Create maps this to
 // "no capacity" so the NodePool retries.
-func TestFleetMemberPromise_Wait_UnassignedReturnsInsufficientCapacity(t *testing.T) {
+func TestFleetMemberPromise_ResolveAssignment_UnassignedReturnsInsufficientCapacity(t *testing.T) {
 	g := NewWithT(t)
 	state := fleet.NewFleetSharedStateForTest(nil, nil, nil, nil, "fleet-test", "rg-test")
 	p := &FleetMemberPromise{
@@ -222,7 +223,7 @@ func TestFleetMemberPromise_Wait_UnassignedReturnsInsufficientCapacity(t *testin
 		nodeClaimName: "nc-missing",
 		fleetName:     "fleet-test",
 	}
-	err := p.Wait()
+	err := p.ResolveAssignment()
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(corecloudprovider.IsInsufficientCapacityError(err)).To(BeTrue())
 }
@@ -410,7 +411,7 @@ func buildPromiseWithPolling(
 	state.RunAssignmentForTest(context.Background())
 
 	fastOpts := fleetvmpoller.InstantOptions()
-	return &FleetMemberPromise{
+	p := &FleetMemberPromise{
 		sharedState:          state,
 		nodeClaimName:        nodeClaimName,
 		capacityType:         "on-demand",
@@ -422,6 +423,11 @@ func buildPromiseWithPolling(
 		instanceTypeProvider: itProvider,
 		pollerOptions:        &fastOpts,
 	}
+	// ResolveAssignment must be called before Wait() to populate .VM/.InstanceType/.Zone.
+	if err := p.ResolveAssignment(); err != nil {
+		t.Fatalf("ResolveAssignment failed in test helper: %v", err)
+	}
+	return p
 }
 
 // TestFleetMemberPromise_Wait_PollingImmediateSuccess verifies Wait() succeeds
@@ -480,9 +486,10 @@ func TestFleetMemberPromise_Wait_PollingFailed(t *testing.T) {
 	err := p.Wait()
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("provisioning failed"))
-	// VM should NOT be set on failure
-	g.Expect(p.VM).To(BeNil())
-	// But InstanceType and Zone should be set from assignment
+	// VM remains set from ResolveAssignment (the stub VM used to build the NodeClaim).
+	// On failure, the goroutine in handleInstancePromise handles cleanup.
+	g.Expect(p.VM).NotTo(BeNil())
+	// InstanceType and Zone should be set from assignment
 	g.Expect(p.InstanceType).NotTo(BeNil())
 	g.Expect(p.Zone).NotTo(BeEmpty())
 }
@@ -573,7 +580,8 @@ func TestFleetMemberPromise_Wait_PollingNonTransientErrorFails(t *testing.T) {
 	err := p.Wait()
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("non-retryable"))
-	g.Expect(p.VM).To(BeNil())
+	// VM remains set from ResolveAssignment (stub from assignment)
+	g.Expect(p.VM).NotTo(BeNil())
 }
 
 // TestFleetMemberPromise_Wait_PollingContextCancelled verifies ctx cancellation.
@@ -632,21 +640,21 @@ func TestFleetMemberPromise_Wait_PollingContextCancelled(t *testing.T) {
 		pollerOptions: &fastOpts,
 	}
 
+	// ResolveAssignment uses a non-cancelled context (shared state is in-memory),
+	// but we need to call it to populate .VM before Wait().
+	p.ctx = context.Background()
+	g.Expect(p.ResolveAssignment()).To(Succeed())
+	p.ctx = ctx // restore cancelled context for Wait()
+
 	err := p.Wait()
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("context canceled"))
 }
 
-// TestFleetMemberPromise_Wait_SharedStateError verifies Wait() returns error
-// immediately when the shared state has a fleet-level error.
-func TestFleetMemberPromise_Wait_SharedStateError(t *testing.T) {
+// TestFleetMemberPromise_ResolveAssignment_SharedStateError verifies ResolveAssignment()
+// returns error immediately when the shared state has a fleet-level error.
+func TestFleetMemberPromise_ResolveAssignment_SharedStateError(t *testing.T) {
 	g := NewWithT(t)
-
-	vmGetter := &mockVMGetterForPromise{
-		responses: []mockVMGetResponse{
-			{vm: makeSucceededVM("fleet-vm-poll")},
-		},
-	}
 
 	state := fleet.NewFleetSharedStateForTest(nil, nil, nil, nil, "fleet-test", "rg-test")
 	state.SetError(errors.New("fleet PUT failed"))
@@ -656,27 +664,17 @@ func TestFleetMemberPromise_Wait_SharedStateError(t *testing.T) {
 		nodeClaimName: "nc-fleet-err",
 		fleetName:     "fleet-test",
 		ctx:           context.Background(),
-		vmClient:      vmGetter,
-		resourceGroup: "MC_rg",
 	}
 
-	err := p.Wait()
+	err := p.ResolveAssignment()
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("fleet PUT failed"))
-	// vmGetter should never be called - error is from shared state
-	g.Expect(vmGetter.CallCount()).To(Equal(0))
 }
 
-// TestFleetMemberPromise_Wait_AssignmentVMWithEmptyName verifies the guard
+// TestFleetMemberPromise_ResolveAssignment_VMWithEmptyName verifies the guard
 // against assignments that have no VM name.
-func TestFleetMemberPromise_Wait_AssignmentVMWithEmptyName(t *testing.T) {
+func TestFleetMemberPromise_ResolveAssignment_VMWithEmptyName(t *testing.T) {
 	g := NewWithT(t)
-
-	vmGetter := &mockVMGetterForPromise{
-		responses: []mockVMGetResponse{
-			{vm: makeSucceededVM("fleet-vm-poll")},
-		},
-	}
 
 	vmSize := armcompute.VirtualMachineSizeTypes("Standard_D4s_v3")
 	assignmentVM := &armcompute.VirtualMachine{
@@ -709,21 +707,23 @@ func TestFleetMemberPromise_Wait_AssignmentVMWithEmptyName(t *testing.T) {
 	)
 	state.RunAssignmentForTest(context.Background())
 
-	fastOpts := fleetvmpoller.InstantOptions()
 	p := &FleetMemberPromise{
 		sharedState:   state,
 		nodeClaimName: "nc-empty-name",
 		fleetName:     "fleet-test",
 		ctx:           context.Background(),
-		vmClient:      vmGetter,
-		resourceGroup: "MC_rg",
-		pollerOptions: &fastOpts,
 	}
 
-	err := p.Wait()
+	err := p.ResolveAssignment()
+	// Empty name means assignment populated .VM but with empty Name — Wait() would fail.
+	// However, ResolveAssignment itself doesn't guard against empty *string name;
+	// it guards against nil Name. Since Name is non-nil (it's lo.ToPtr("")),
+	// ResolveAssignment succeeds but Wait() should fail.
+	if err == nil {
+		err = p.Wait()
+	}
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("no VM name"))
-	g.Expect(vmGetter.CallCount()).To(Equal(0))
 }
 
 // TestFleetMemberPromise_Wait_LegacyPathNoVMClient verifies the fallback behavior
@@ -769,6 +769,7 @@ func TestFleetMemberPromise_Wait_LegacyPathNoVMClient(t *testing.T) {
 		// vmClient intentionally nil
 	}
 
+	g.Expect(p.ResolveAssignment()).To(Succeed())
 	g.Expect(p.Wait()).To(Succeed())
 	g.Expect(p.VM).NotTo(BeNil())
 	g.Expect(lo.FromPtr(p.VM.Name)).To(Equal("vm-legacy"))

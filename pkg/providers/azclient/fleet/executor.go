@@ -21,19 +21,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	armcomputefleet "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computefleet/armcomputefleet/v2"
 	"github.com/go-logr/logr"
 	"github.com/samber/lo"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -50,22 +45,6 @@ const (
 	// limit to avoid excessively large ARM operations. This is hardcoded because it
 	// is an Azure platform constraint, not a user-tunable setting.
 	MaxFleetCapacity = 1000
-
-	// vmVisibilityPollInterval is how often we re-poll the standalone armcompute
-	// VirtualMachines GET API while waiting for a Fleet-created VM to become visible there.
-	// DefaultVMVisibilityPollInterval is how often we re-poll the standalone armcompute
-	// VirtualMachines GET API while waiting for a Fleet-created VM to become visible there.
-	// Fleet's ListVirtualMachines API can report a VM (e.g. OperationStatus=Launching)
-	// before the standalone VM GET API can find it, due to a brief ARM propagation lag.
-	DefaultVMVisibilityPollInterval = 2 * time.Second
-
-	// DefaultVMVisibilityMaxWait bounds how long we wait for a single VM to become visible
-	// via GET before giving up on it. Without this bound, a VM that never resolves (e.g. it
-	// was actually never created) would hang the batch forever, since the executeBatch
-	// context has no deadline of its own. If we give up, that VM is simply excluded from
-	// this batch's assignment; it will still be tagged/reclaimed by later passes if it
-	// eventually appears, or reclaimed by GC as a surplus/unassigned instance.
-	DefaultVMVisibilityMaxWait = 60 * time.Second
 )
 
 // executor sends batches to the Azure Fleet API.
@@ -86,12 +65,6 @@ type executor struct {
 	// this are split. Defaults to MaxFleetCapacity. Exposed as a field only for
 	// unit test overrides.
 	maxFleetCapacity int
-
-	// vmVisibilityPollInterval and vmVisibilityMaxWait control getVMWaitingForVisibility's
-	// retry-on-404 loop. Default to DefaultVMVisibilityPollInterval/DefaultVMVisibilityMaxWait;
-	// exposed as fields only for unit test overrides (so tests don't take real wall-clock time).
-	vmVisibilityPollInterval time.Duration
-	vmVisibilityMaxWait      time.Duration
 }
 
 func newExecutor(
@@ -103,15 +76,13 @@ func newExecutor(
 	location string,
 ) *executor {
 	return &executor{
-		fleetClient:              fleetClient,
-		vmClient:                 vmClient,
-		errorHandler:             errorHandler,
-		clusterName:              clusterName,
-		resourceGroup:            resourceGroup,
-		location:                 location,
-		maxFleetCapacity:         MaxFleetCapacity,
-		vmVisibilityPollInterval: DefaultVMVisibilityPollInterval,
-		vmVisibilityMaxWait:      DefaultVMVisibilityMaxWait,
+		fleetClient:      fleetClient,
+		vmClient:         vmClient,
+		errorHandler:     errorHandler,
+		clusterName:      clusterName,
+		resourceGroup:    resourceGroup,
+		location:         location,
+		maxFleetCapacity: MaxFleetCapacity,
 	}
 }
 
@@ -384,7 +355,10 @@ func fleetName(clusterName, batchKey string) string {
 }
 
 // listFleetVMs lists VMs belonging to a specific Fleet using the Fleet's ListVirtualMachines API.
-// This returns VMs that the Fleet created, identified by fleet name directly (no tag filtering needed).
+// The Fleet SDK (v2 beta.3+) returns VMSize and Zone directly, so no compute GET is needed.
+// The returned armcompute.VirtualMachine stubs carry ID, Name, Type, VMSize, Zone, and Location
+// (from the executor's region). ProvisioningState is NOT available from the Fleet SDK — it is
+// resolved later in FleetMemberPromise.Wait() via the fleetvmpoller.
 func (e *executor) listFleetVMs(ctx context.Context, name string) ([]*armcompute.VirtualMachine, error) {
 	logger := log.FromContext(ctx).WithValues("fleetName", name)
 
@@ -412,11 +386,8 @@ func (e *executor) listFleetVMs(ctx context.Context, name string) ([]*armcompute
 		return nil, nil
 	}
 
-	// The Fleet API returns fleet VirtualMachine objects (with ID/Name/OperationStatus).
-	// We need to fetch the full compute VM objects for assignment.
-	// NOTE: We only extract minimal fields (ID, Name, VMSize, Zone, ProvisioningState)
-	// to simulate what the future Fleet ListVirtualMachines API will provide directly.
-	// The full VM object is fetched later in FleetMemberPromise.Wait() via polling.
+	// Convert Fleet SDK VirtualMachine → armcompute.VirtualMachine using fields
+	// available directly from the Fleet ListVirtualMachines API (no compute GET needed).
 	var vms []*armcompute.VirtualMachine
 	for _, fvm := range fleetVMs {
 		if fvm == nil || fvm.Name == nil {
@@ -427,113 +398,58 @@ func (e *executor) listFleetVMs(ctx context.Context, name string) ([]*armcompute
 		if fvm.OperationStatus != nil {
 			opStatus = string(*fvm.OperationStatus)
 		}
-		logger.Info("fleet VM", "vm", vmName, "operationStatus", opStatus, "id", lo.FromPtr(fvm.ID))
+		// Log all fields returned by Fleet ListVirtualMachines API
+		var errMsg string
+		if fvm.Error != nil {
+			if fvm.Error.Code != nil {
+				errMsg = *fvm.Error.Code
+			}
+			if fvm.Error.Message != nil {
+				errMsg += ": " + *fvm.Error.Message
+			}
+		}
+		logger.Info("listFleetVMs: VM entry",
+			"vm", vmName,
+			"operationStatus", opStatus,
+			"id", lo.FromPtr(fvm.ID),
+			"type", lo.FromPtr(fvm.Type),
+			"vmSize", lo.FromPtr(fvm.VMSize),
+			"zone", lo.FromPtr(fvm.Zone),
+			"priority", lo.FromPtr(fvm.Priority),
+			"error", errMsg,
+		)
 
-		// Only include VMs that are successfully created at Fleet level.
-		// VMs with OperationStatus=Failed never got created in ARM; no point polling them.
+		// Skip VMs that failed at Fleet level — they were never created in ARM.
 		if fvm.OperationStatus != nil && *fvm.OperationStatus == armcomputefleet.VMOperationStatusFailed {
 			logger.Info("skipping failed fleet VM", "vm", vmName)
 			continue
 		}
 
-		// Fetch VM to get minimal fields (simulating future Fleet ListVMs API enrichment).
-		// Only extract: ID, Name, VMSize, Zone, ProvisioningState.
-		//
-		// Fleet's ListVirtualMachines API can list a VM before the standalone armcompute
-		// VirtualMachines GET API can find it (brief ARM propagation lag), which surfaces
-		// as a 404 here immediately after Fleet creation. Wait/retry through that 404
-		// instead of dropping the VM: previously, dropping it here caused runAssignment to
-		// see 0 usable VMs, fail the whole batch's NodeClaims, and each failed NodeClaim
-		// retry would create yet another brand-new Fleet (fleet names are randomized per
-		// invocation), compounding into many orphaned Fleets/VMs for one logical request.
-		vmResp, err := e.getVMWaitingForVisibility(ctx, vmName, logger)
-		if err != nil {
-			logger.Error(err, "failed to get VM details", "vm", vmName)
-			continue
-		}
-
-		// Build a minimal VM object with only the fields the Fleet ListVMs API will provide.
-		// This simulates the future API response where these fields come directly from Fleet.
-		//
-		// Location is set from e.location (the executor's own Fleet region), not from
-		// vmResp: every VM a Fleet creates lives in that Fleet's region, so this avoids
-		// an extra dependency on the VM Get() response. It is required by skuAndZone/
-		// MakeAKSLabelZoneFromVM to build the AKS zone label for zonal VMs; without it,
-		// every zonal VM fails zone resolution, is dropped to surplus, and its NodeClaim
-		// gets a spurious insufficient-capacity error.
-		minimalVM := &armcompute.VirtualMachine{
-			ID:       vmResp.VirtualMachine.ID,
-			Name:     vmResp.VirtualMachine.Name,
-			Type:     vmResp.VirtualMachine.Type,
+		// Build armcompute.VirtualMachine from Fleet SDK fields.
+		// Location is set from e.location (the executor's own Fleet region):
+		// every VM a Fleet creates lives in that Fleet's region. Required by
+		// skuAndZone/MakeAKSLabelZoneFromVM for zone label resolution.
+		vm := &armcompute.VirtualMachine{
+			ID:       fvm.ID,
+			Name:     fvm.Name,
+			Type:     fvm.Type,
 			Location: lo.ToPtr(e.location),
 		}
-		if vmResp.VirtualMachine.Properties != nil {
-			minimalVM.Properties = &armcompute.VirtualMachineProperties{
-				ProvisioningState: vmResp.VirtualMachine.Properties.ProvisioningState,
-			}
-			if vmResp.VirtualMachine.Properties.HardwareProfile != nil {
-				minimalVM.Properties.HardwareProfile = &armcompute.HardwareProfile{
-					VMSize: vmResp.VirtualMachine.Properties.HardwareProfile.VMSize,
-				}
+		if fvm.VMSize != nil {
+			vm.Properties = &armcompute.VirtualMachineProperties{
+				HardwareProfile: &armcompute.HardwareProfile{
+					VMSize: lo.ToPtr(armcompute.VirtualMachineSizeTypes(*fvm.VMSize)),
+				},
 			}
 		}
-		if len(vmResp.VirtualMachine.Zones) > 0 {
-			minimalVM.Zones = vmResp.VirtualMachine.Zones
+		// Fleet SDK returns Zone as a single *string (e.g. "1");
+		// armcompute.VirtualMachine.Zones is []*string.
+		if fvm.Zone != nil {
+			vm.Zones = []*string{fvm.Zone}
 		}
-		vms = append(vms, minimalVM)
+		vms = append(vms, vm)
 	}
 
-	logger.Info("listFleetVMs resolved compute VMs", "resolvedCount", len(vms), "fleetVMCount", len(fleetVMs))
+	logger.Info("listFleetVMs converted fleet VMs", "convertedCount", len(vms), "fleetVMCount", len(fleetVMs))
 	return vms, nil
-}
-
-// getVMWaitingForVisibility calls e.vmClient.Get, and if the response is a 404
-// (ResourceNotFound), retries on a fixed interval until the VM becomes visible, a
-// non-404 error occurs, or e.vmVisibilityMaxWait elapses. This bridges the ARM
-// propagation lag between Fleet's ListVirtualMachines reporting a VM and that VM
-// becoming resolvable through the standalone armcompute VirtualMachines GET API.
-func (e *executor) getVMWaitingForVisibility(ctx context.Context, vmName string, logger logr.Logger) (armcompute.VirtualMachinesClientGetResponse, error) {
-	pollInterval := e.vmVisibilityPollInterval
-	if pollInterval <= 0 {
-		pollInterval = DefaultVMVisibilityPollInterval
-	}
-	maxWait := e.vmVisibilityMaxWait
-	if maxWait <= 0 {
-		maxWait = DefaultVMVisibilityMaxWait
-	}
-
-	var (
-		vmResp armcompute.VirtualMachinesClientGetResponse
-		getErr error
-	)
-	// PollUntilContextTimeout derives its own deadline context internally from ctx,
-	// so no manual context.WithTimeout wrapping is needed here.
-	pollErr := wait.PollUntilContextTimeout(ctx, pollInterval, maxWait, true, func(pollCtx context.Context) (bool, error) {
-		vmResp, getErr = e.vmClient.Get(pollCtx, e.resourceGroup, vmName, nil)
-		if getErr == nil {
-			return true, nil
-		}
-		if !isNotFoundError(getErr) {
-			// Non-404 error (auth, throttling, etc.): stop retrying, surface immediately.
-			return false, getErr
-		}
-		logger.V(1).Info("VM not yet visible via GET, waiting for ARM propagation", "vm", vmName, "error", getErr.Error())
-		return false, nil
-	})
-	if pollErr != nil {
-		if errors.Is(pollErr, context.DeadlineExceeded) {
-			return armcompute.VirtualMachinesClientGetResponse{}, fmt.Errorf("VM %q did not become visible within %s: %w", vmName, maxWait, getErr)
-		}
-		return armcompute.VirtualMachinesClientGetResponse{}, pollErr
-	}
-	return vmResp, nil
-}
-
-// isNotFoundError reports whether err is an Azure ResponseError with a 404 status code.
-func isNotFoundError(err error) bool {
-	var respErr *azcore.ResponseError
-	if errors.As(err, &respErr) {
-		return respErr.StatusCode == http.StatusNotFound
-	}
-	return false
 }

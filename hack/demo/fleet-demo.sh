@@ -8,12 +8,12 @@ set -euo pipefail
 # Configuration
 ###############################################################################
 export AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:-2994199d-5716-49a3-80aa-eb2ff114e431}"
-export AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-awarhekar-aks-rg}"
+export AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-awarhekar-aks-karpenter-rg}"
 export AZURE_CLUSTER_NAME="${AZURE_CLUSTER_NAME:-karpenter}"
 export AZURE_LOCATION="${AZURE_LOCATION:-eastus2euap}"
 export AZURE_ACR_NAME="${AZURE_ACR_NAME:-awarhekarfleetacr}"
 export AZURE_ACR_URL="${AZURE_ACR_NAME}.azurecr.io"
-export AZURE_NODE_RESOURCE_GROUP="${AZURE_NODE_RESOURCE_GROUP:-MC_awarhekar-aks-rg_karpenter_eastus2euap}"
+export AZURE_NODE_RESOURCE_GROUP="${AZURE_NODE_RESOURCE_GROUP:-MC_awarhekar-aks-karpenter-rg_karpenter_eastus2euap}"
 export KARPENTER_MSI_NAME="${KARPENTER_MSI_NAME:-karpentermsi}"
 export KARPENTER_SA_NAME="${KARPENTER_SA_NAME:-karpenter-sa}"
 export PROVISION_MODE="fleet"
@@ -25,7 +25,7 @@ export LOG_LEVEL="${LOG_LEVEL:-debug}"
 # (see hack/demo/fleet-demo.sh interconnect). VM size defaults to the GPU SKU this
 # feature targets; override via AZURE_GPU_VM_SIZE if needed for testing.
 export AZURE_INTERCONNECT_BLOCK_ID="${AZURE_INTERCONNECT_BLOCK_ID:-}"
-export AZURE_INTERCONNECT_GROUP_ID="${AZURE_INTERCONNECT_GROUP_ID:-}"
+export AZURE_INTERCONNECT_GROUP_ID="${AZURE_INTERCONNECT_GROUP_ID:-/subscriptions/2994199d-5716-49a3-80aa-eb2ff114e431/resourceGroups/awarhekar-aks-karpenter-rg/providers/Microsoft.Network/interconnectGroups/awarhekar-aks-karpenter-rg-icg}"
 export AZURE_INTERCONNECT_SUBGROUP_ID="${AZURE_INTERCONNECT_SUBGROUP_ID:-}"
 export AZURE_GPU_VM_SIZE="${AZURE_GPU_VM_SIZE:-Standard_ND128isr_GB300_v6}"
 
@@ -132,7 +132,8 @@ step_setup() {
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --location "$AZURE_LOCATION" \
             --node-resource-group "$AZURE_NODE_RESOURCE_GROUP" \
-            --node-count 2 \
+            --node-count 1 \
+            --node-vm-size Standard_D4ads_v5 \
             --network-plugin azure \
             --network-plugin-mode overlay \
             --network-dataplane cilium \
@@ -616,26 +617,38 @@ EOF
 ###############################################################################
 step_provision_interconnect() {
     header "Step 3b: Provision GPU Node with Interconnect Placement (Fleet-only)"
-    echo "This step applies an AKSNodeClass + NodePool exercising the 3 new interconnect"
-    echo "fields (interconnectBlockID, interconnectGroupID, interconnectSubgroupID) and a"
+    echo "This step applies an AKSNodeClass + NodePool exercising the interconnect"
+    echo "placement fields. AZURE_INTERCONNECT_GROUP_ID is required."
+    echo "AZURE_INTERCONNECT_SUBGROUP_ID and AZURE_INTERCONNECT_BLOCK_ID are optional."
     echo "sku-name requirement pinned to \$AZURE_GPU_VM_SIZE ($AZURE_GPU_VM_SIZE)."
-    echo ""
-    echo "The 3 interconnect fields are set from AZURE_INTERCONNECT_BLOCK_ID /"
-    echo "AZURE_INTERCONNECT_GROUP_ID / AZURE_INTERCONNECT_SUBGROUP_ID env vars."
-    echo "These MUST be real ARM resource IDs supplied by the caller — this step will"
-    echo "refuse to run with them unset, since empty values would produce a NodeClass"
-    echo "that is indistinguishable from one that doesn't use this feature at all."
     echo ""
     cd "$REPO_DIR"
 
-    if [[ -z "$AZURE_INTERCONNECT_BLOCK_ID" || -z "$AZURE_INTERCONNECT_GROUP_ID" || -z "$AZURE_INTERCONNECT_SUBGROUP_ID" ]]; then
-        err "AZURE_INTERCONNECT_BLOCK_ID, AZURE_INTERCONNECT_GROUP_ID, and AZURE_INTERCONNECT_SUBGROUP_ID must all be set."
+    if [[ -z "${AZURE_INTERCONNECT_GROUP_ID:-}" ]]; then
+        err "AZURE_INTERCONNECT_GROUP_ID must be set."
         echo "  Example:"
-        echo "    export AZURE_INTERCONNECT_BLOCK_ID=/subscriptions/.../interconnectBlocks/<name>"
-        echo "    export AZURE_INTERCONNECT_GROUP_ID=/subscriptions/.../interconnectGroups/<name>"
-        echo "    export AZURE_INTERCONNECT_SUBGROUP_ID=/subscriptions/.../interconnectGroups/<name>/subgroups/<name>"
+        echo "    export AZURE_INTERCONNECT_GROUP_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/interconnectGroups/<name>"
+        echo "    # optional:"
+        echo "    export AZURE_INTERCONNECT_SUBGROUP_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/interconnectGroups/<name>/subgroups/subgroup0"
+        echo "    export AZURE_INTERCONNECT_BLOCK_ID=/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Compute/interconnectBlocks/<name>"
         echo "    ./hack/demo/fleet-demo.sh interconnect"
         exit 1
+    fi
+
+    # Build AKSNodeClass spec conditionally — all three fields are optional except ICG.
+    ICB_FIELD=""
+    ICG_SUBGROUP_FIELD=""
+    if [[ -n "${AZURE_INTERCONNECT_BLOCK_ID:-}" ]]; then
+        ICB_FIELD="  interconnectBlockID: \"${AZURE_INTERCONNECT_BLOCK_ID}\""
+        info "interconnectBlockID set — will include in AKSNodeClass."
+    else
+        info "AZURE_INTERCONNECT_BLOCK_ID not set — skipping."
+    fi
+    if [[ -n "${AZURE_INTERCONNECT_SUBGROUP_ID:-}" ]]; then
+        ICG_SUBGROUP_FIELD="  interconnectSubgroupID: \"${AZURE_INTERCONNECT_SUBGROUP_ID}\""
+        info "interconnectSubgroupID set — will include in AKSNodeClass."
+    else
+        info "AZURE_INTERCONNECT_SUBGROUP_ID not set — skipping."
     fi
 
     info "Applying AKSNodeClass 'gpu-interconnect'..."
@@ -645,12 +658,12 @@ kind: AKSNodeClass
 metadata:
   name: gpu-interconnect
   annotations:
-    kubernetes.io/description: "Fleet demo — GPU nodes pinned to an interconnect topology"
+    kubernetes.io/description: "Fleet demo - GPU nodes pinned to an interconnect topology"
 spec:
   imageFamily: Ubuntu2204
-  interconnectBlockID: "${AZURE_INTERCONNECT_BLOCK_ID}"
+${ICB_FIELD}
   interconnectGroupID: "${AZURE_INTERCONNECT_GROUP_ID}"
-  interconnectSubgroupID: "${AZURE_INTERCONNECT_SUBGROUP_ID}"
+${ICG_SUBGROUP_FIELD}
 EOF
     ok "AKSNodeClass 'gpu-interconnect' applied."
 
@@ -685,7 +698,7 @@ spec:
       requirements:
         - key: kubernetes.io/arch
           operator: In
-          values: ["amd64"]
+          values: ["arm64"]
         - key: kubernetes.io/os
           operator: In
           values: ["linux"]
@@ -879,7 +892,8 @@ step_cleanup() {
     info "Deleting Kubernetes resources (deployments, nodepools, nodeclass)..."
     kubectl delete deployments --all -n default --ignore-not-found
     kubectl delete nodepools --all --ignore-not-found
-    kubectl delete aksnodeclasses default gpu-interconnect --ignore-not-found
+    kubectl delete aksnodeclasses default --ignore-not-found
+    # kubectl delete aksnodeclasses gpu-interconnect --ignore-not-found  # interconnect disabled
     ok "Kubernetes resources deleted."
 
     echo ""

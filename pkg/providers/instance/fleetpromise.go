@@ -62,13 +62,17 @@ type FleetMemberPromise struct {
 // Ensure FleetMemberPromise implements Promise.
 var _ Promise = (*FleetMemberPromise)(nil)
 
-// Wait blocks until the fleet batch completes, a VM is assigned to this NodeClaim,
-// and the VM's provisioningState reaches a terminal state (Succeeded or Failed).
+// ResolveAssignment reads the batch assignment and populates .VM, .InstanceType,
+// .Zone, and .ProviderID from the stub VM returned by listFleetVMs. This is a
+// fast, in-memory operation (no network calls) and must be called synchronously
+// before handing the promise to handleInstancePromise for async polling.
 //
-// If the VM reaches Failed, Wait invokes the error handler to mark offerings as
-// unavailable in the cache (same pattern as SI VM's WaitFunc closure) and returns
-// an error so the background goroutine triggers cleanup.
-func (p *FleetMemberPromise) Wait() error {
+// After ResolveAssignment succeeds, the promise carries enough data to construct
+// a NodeClaim (vmInstanceToNodeClaim reads ID, Name, VMSize, Zone, Location from
+// .VM). Fields not available from the Fleet SDK (Tags, TimeCreated, ImageReference,
+// ProvisioningState) have acceptable fallbacks in core — they are filled later
+// either by the Registration controller or CloudProvider.Get().
+func (p *FleetMemberPromise) ResolveAssignment() error {
 	if err := p.sharedState.GetError(); err != nil {
 		return err
 	}
@@ -81,12 +85,34 @@ func (p *FleetMemberPromise) Wait() error {
 
 	p.InstanceType = assignment.InstanceType
 	p.Zone = assignment.Zone
+	p.VM = assignment.VM
 
-	// The assignment carries a minimal VM (ID, Name, VMSize, Zone, ProvisioningState)
-	// from listFleetVMs. We need to poll until provisioningState is terminal.
-	vmName := lo.FromPtr(assignment.VM.Name)
+	if p.VM == nil || p.VM.Name == nil {
+		return fmt.Errorf("fleet assignment for NodeClaim %s has no VM", p.nodeClaimName)
+	}
+	if p.VM.ID != nil {
+		p.ProviderID = utils.VMResourceIDToProviderID(p.ctx, *p.VM.ID)
+	}
+	return nil
+}
+
+// Wait polls the VM's provisioningState until it reaches a terminal state
+// (Succeeded or Failed). This is designed to run asynchronously inside
+// handleInstancePromise's goroutine — it provides fast failure detection
+// (~5-60s) instead of relying on core's 15-min liveness timeout.
+//
+// If the VM reaches Failed, Wait invokes the error handler to mark offerings as
+// unavailable in the cache (same pattern as SI VM's WaitFunc closure) and returns
+// an error so the background goroutine triggers cleanup + NodeClaim deletion.
+//
+// On success, Wait updates .VM with the full VM object from the compute GET
+// (which includes Tags, TimeCreated, ImageReference, etc.) — though the NodeClaim
+// was already created from the stub VM by ResolveAssignment, these fields are
+// informational and not required for correctness.
+func (p *FleetMemberPromise) Wait() error {
+	vmName := lo.FromPtr(p.VM.Name)
 	if vmName == "" {
-		return fmt.Errorf("fleet assignment for NodeClaim %s has no VM name", p.nodeClaimName)
+		return fmt.Errorf("fleet promise for NodeClaim %s has no VM name (call ResolveAssignment first)", p.nodeClaimName)
 	}
 
 	// Poll compute GET until provisioningState reaches Succeeded or Failed.
@@ -96,7 +122,7 @@ func (p *FleetMemberPromise) Wait() error {
 		return pollErr
 	}
 
-	// Provisioning succeeded - populate promise with the full VM object.
+	// Provisioning succeeded — update .VM with the full object.
 	p.VM = vm
 	if p.VM != nil && p.VM.ID != nil {
 		p.ProviderID = utils.VMResourceIDToProviderID(p.ctx, *p.VM.ID)

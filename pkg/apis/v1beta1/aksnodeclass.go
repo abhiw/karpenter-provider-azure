@@ -135,17 +135,17 @@ type AKSNodeClassSpec struct {
 	LinuxOSConfig *LinuxOSConfiguration `json:"linuxOSConfig,omitempty"`
 	// interconnectBlockID is the full ARM resource ID of the InterconnectBlock to associate with
 	// provisioned Fleet resources. Applies only to Fleet-mode provisioning.
-	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectBlocks\/[^\/]+$`
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Compute\/interconnectBlocks\/[^\/]+$`
 	// +optional
 	InterconnectBlockID *string `json:"interconnectBlockID,omitempty"`
 	// interconnectGroupID is the full ARM resource ID of the InterconnectGroup to associate with
 	// provisioned Fleet resources. Applies only to Fleet-mode provisioning.
-	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectGroups\/[^\/]+$`
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/interconnectGroups\/[^\/]+$`
 	// +optional
 	InterconnectGroupID *string `json:"interconnectGroupID,omitempty"`
 	// interconnectSubgroupID is the full ARM resource ID of the InterconnectGroup subgroup to
 	// associate with provisioned Fleet resources. Applies only to Fleet-mode provisioning.
-	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectGroups\/[^\/]+\/subgroups\/[^\/]+$`
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/interconnectGroups\/[^\/]+\/subgroups\/[^\/]+$`
 	// +optional
 	InterconnectSubgroupID *string `json:"interconnectSubgroupID,omitempty"`
 }

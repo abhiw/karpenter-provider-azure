@@ -20,15 +20,12 @@ import (
 	"context"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/computefleet/armcomputefleet/v2"
-	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -291,189 +288,56 @@ func TestExecutor_BatchSplitting(t *testing.T) {
 
 // --- Tests for getVMWaitingForVisibility (retry-on-404 for ARM propagation lag) ---
 
-// mockVMAPIWithGetSequence lets tests script a sequence of Get() outcomes by call number,
-// via getFunc, and tracks how many times Get was called (for assertions on retry counts).
-type mockVMAPIWithGetSequence struct {
-	getCalls int32
-	getFunc  func(callNum int32) (armcompute.VirtualMachinesClientGetResponse, error)
-}
-
-func (m *mockVMAPIWithGetSequence) Get(_ context.Context, _ string, _ string, _ *armcompute.VirtualMachinesClientGetOptions) (armcompute.VirtualMachinesClientGetResponse, error) {
-	call := atomic.AddInt32(&m.getCalls, 1)
-	return m.getFunc(call)
-}
-
-func (m *mockVMAPIWithGetSequence) BeginUpdate(_ context.Context, _ string, _ string, _ armcompute.VirtualMachineUpdate, _ *armcompute.VirtualMachinesClientBeginUpdateOptions) (*runtime.Poller[armcompute.VirtualMachinesClientUpdateResponse], error) {
-	return nil, nil
-}
-
-func (m *mockVMAPIWithGetSequence) BeginDelete(_ context.Context, _ string, _ string, _ *armcompute.VirtualMachinesClientBeginDeleteOptions) (*runtime.Poller[armcompute.VirtualMachinesClientDeleteResponse], error) {
-	return nil, nil
-}
-
-func (m *mockVMAPIWithGetSequence) NewListPager(_ string, _ *armcompute.VirtualMachinesClientListOptions) *runtime.Pager[armcompute.VirtualMachinesClientListResponse] {
-	return runtime.NewPager(runtime.PagingHandler[armcompute.VirtualMachinesClientListResponse]{
-		More: func(_ armcompute.VirtualMachinesClientListResponse) bool { return false },
-		Fetcher: func(_ context.Context, _ *armcompute.VirtualMachinesClientListResponse) (armcompute.VirtualMachinesClientListResponse, error) {
-			return armcompute.VirtualMachinesClientListResponse{}, nil
-		},
-	})
-}
-
-// notFoundErr simulates the 404 ResponseError returned by the armcompute SDK when a
-// VM has not yet propagated to the standalone VirtualMachines GET API.
-func notFoundErr() error {
-	return &azcore.ResponseError{StatusCode: http.StatusNotFound, ErrorCode: "ResourceNotFound"}
-}
-
-// forbiddenErr simulates a non-404 (non-retryable) ResponseError, e.g. an auth failure.
-func forbiddenErr() error {
-	return &azcore.ResponseError{StatusCode: http.StatusForbidden, ErrorCode: "AuthorizationFailed"}
-}
-
-// TestGetVMWaitingForVisibility_RetriesOn404ThenSucceeds verifies that a VM which
-// returns 404 on its first few GETs (simulating ARM propagation lag right after a
-// Fleet PUT) is still resolved once the GET eventually succeeds, instead of being
-// dropped after the first 404.
-func TestGetVMWaitingForVisibility_RetriesOn404ThenSucceeds(t *testing.T) {
-	g := NewWithT(t)
-
-	vmAPI := &mockVMAPIWithGetSequence{
-		getFunc: func(call int32) (armcompute.VirtualMachinesClientGetResponse, error) {
-			if call < 3 {
-				return armcompute.VirtualMachinesClientGetResponse{}, notFoundErr()
-			}
-			return armcompute.VirtualMachinesClientGetResponse{
-				VirtualMachine: armcompute.VirtualMachine{
-					Name: lo.ToPtr("vm-1"),
-					ID:   lo.ToPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-1"),
-				},
-			}, nil
-		},
-	}
-
-	exec := &executor{
-		vmClient:                 vmAPI,
-		resourceGroup:            "rg",
-		vmVisibilityPollInterval: time.Millisecond,
-		vmVisibilityMaxWait:      time.Second,
-	}
-
-	resp, err := exec.getVMWaitingForVisibility(context.Background(), "vm-1", logr.Discard())
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(lo.FromPtr(resp.VirtualMachine.Name)).To(Equal("vm-1"))
-	g.Expect(atomic.LoadInt32(&vmAPI.getCalls)).To(Equal(int32(3)), "should have retried through 2 404s before succeeding on the 3rd call")
-}
-
-// TestGetVMWaitingForVisibility_NonNotFoundErrorFailsFast verifies that a non-404
-// error (e.g. AuthorizationFailed) is surfaced immediately without retrying, since
-// retrying would not help and would only slow down the batch.
-func TestGetVMWaitingForVisibility_NonNotFoundErrorFailsFast(t *testing.T) {
-	g := NewWithT(t)
-
-	vmAPI := &mockVMAPIWithGetSequence{
-		getFunc: func(_ int32) (armcompute.VirtualMachinesClientGetResponse, error) {
-			return armcompute.VirtualMachinesClientGetResponse{}, forbiddenErr()
-		},
-	}
-
-	exec := &executor{
-		vmClient:                 vmAPI,
-		resourceGroup:            "rg",
-		vmVisibilityPollInterval: time.Millisecond,
-		vmVisibilityMaxWait:      time.Second,
-	}
-
-	_, err := exec.getVMWaitingForVisibility(context.Background(), "vm-1", logr.Discard())
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(atomic.LoadInt32(&vmAPI.getCalls)).To(Equal(int32(1)), "non-404 errors must not be retried")
-}
-
-// TestGetVMWaitingForVisibility_TimesOutAfterPersistent404 verifies that a VM which
-// never becomes visible (persistent 404) is eventually given up on, rather than
-// hanging the batch forever, and that the returned error is descriptive.
-func TestGetVMWaitingForVisibility_TimesOutAfterPersistent404(t *testing.T) {
-	g := NewWithT(t)
-
-	vmAPI := &mockVMAPIWithGetSequence{
-		getFunc: func(_ int32) (armcompute.VirtualMachinesClientGetResponse, error) {
-			return armcompute.VirtualMachinesClientGetResponse{}, notFoundErr()
-		},
-	}
-
-	exec := &executor{
-		vmClient:                 vmAPI,
-		resourceGroup:            "rg",
-		vmVisibilityPollInterval: time.Millisecond,
-		vmVisibilityMaxWait:      20 * time.Millisecond,
-	}
-
-	_, err := exec.getVMWaitingForVisibility(context.Background(), "vm-1", logr.Discard())
-	g.Expect(err).To(HaveOccurred())
-	g.Expect(err.Error()).To(ContainSubstring("did not become visible"))
-	g.Expect(atomic.LoadInt32(&vmAPI.getCalls)).To(BeNumerically(">", 1), "should have retried at least once before timing out")
-}
-
-// TestIsNotFoundError verifies the 404 status-code predicate used to decide whether
-// to retry a VM GET.
-func TestIsNotFoundError(t *testing.T) {
-	g := NewWithT(t)
-
-	g.Expect(isNotFoundError(notFoundErr())).To(BeTrue())
-	g.Expect(isNotFoundError(forbiddenErr())).To(BeFalse())
-	g.Expect(isNotFoundError(nil)).To(BeFalse())
-	g.Expect(isNotFoundError(context.DeadlineExceeded)).To(BeFalse())
-}
-
-// TestListFleetVMs_ResolvesZoneUsingExecutorLocation verifies that the minimal VM
-// object built by listFleetVMs carries a Location, so that zonal VMs resolve to a
-// valid AKS zone label. Location is populated from the executor's own location
-// field (the region the Fleet itself was created in), not from the VM Get()
-// response: every VM a Fleet creates lives in that Fleet's region, so this needs
-// no extra dependency on vmResp. Without it, MakeAKSLabelZoneFromVM fails for any
-// zonal VM (it requires Location whenever the VM has exactly one zone), which
-// drops every such VM to "surplus" during assignment and produces a spurious
-// insufficient-capacity error for its NodeClaim.
-func TestListFleetVMs_ResolvesZoneUsingExecutorLocation(t *testing.T) {
+// TestListFleetVMs_UsesFleetSDKFields verifies that listFleetVMs converts Fleet SDK
+// VirtualMachine fields (ID, Name, VMSize, Zone) directly to armcompute.VirtualMachine
+// without any compute GET calls, and that Location is populated from the executor's
+// own location field so that zonal VMs resolve to valid AKS zone labels.
+func TestListFleetVMs_UsesFleetSDKFields(t *testing.T) {
 	g := NewWithT(t)
 
 	fleetAPI := &mockFleetAPI{
 		listVMs: []*armcomputefleet.VirtualMachine{
-			{Name: lo.ToPtr("vm-1")},
-		},
-	}
-	vmAPI := &mockVMAPIWithGetSequence{
-		getFunc: func(_ int32) (armcompute.VirtualMachinesClientGetResponse, error) {
-			return armcompute.VirtualMachinesClientGetResponse{
-				VirtualMachine: armcompute.VirtualMachine{
-					Name:  lo.ToPtr("vm-1"),
-					ID:    lo.ToPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-1"),
-					Zones: []*string{lo.ToPtr("1")},
-					Properties: &armcompute.VirtualMachineProperties{
-						HardwareProfile: &armcompute.HardwareProfile{
-							VMSize: lo.ToPtr(armcompute.VirtualMachineSizeTypes("Standard_D2s_v3")),
-						},
-					},
-				},
-			}, nil
+			{
+				Name:   lo.ToPtr("vm-1"),
+				ID:     lo.ToPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-1"),
+				VMSize: lo.ToPtr("Standard_D2s_v3"),
+				Zone:   lo.ToPtr("1"),
+			},
+			{
+				Name:   lo.ToPtr("vm-2"),
+				ID:     lo.ToPtr("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-2"),
+				VMSize: lo.ToPtr("Standard_D4s_v3"),
+				// No zone — non-zonal VM
+			},
 		},
 	}
 
 	exec := &executor{
-		fleetClient:              fleetAPI,
-		vmClient:                 vmAPI,
-		resourceGroup:            "rg",
-		location:                 "southcentralus",
-		vmVisibilityPollInterval: time.Millisecond,
-		vmVisibilityMaxWait:      time.Second,
+		fleetClient:   fleetAPI,
+		resourceGroup: "rg",
+		location:      "southcentralus",
 	}
 
 	vms, err := exec.listFleetVMs(context.Background(), "some-fleet")
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(vms).To(HaveLen(1))
-	g.Expect(lo.FromPtr(vms[0].Location)).To(Equal("southcentralus"), "Location must come from the executor's own field, not vmResp")
+	g.Expect(vms).To(HaveLen(2))
 
+	// VM 1: zonal, with VMSize
+	g.Expect(lo.FromPtr(vms[0].Name)).To(Equal("vm-1"))
+	g.Expect(lo.FromPtr(vms[0].ID)).To(Equal("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-1"))
+	g.Expect(string(lo.FromPtr(vms[0].Properties.HardwareProfile.VMSize))).To(Equal("Standard_D2s_v3"))
+	g.Expect(vms[0].Zones).To(HaveLen(1))
+	g.Expect(lo.FromPtr(vms[0].Zones[0])).To(Equal("1"))
+	g.Expect(lo.FromPtr(vms[0].Location)).To(Equal("southcentralus"), "Location must come from executor")
+
+	// Verify zone label resolves correctly
 	zone, err := zones.MakeAKSLabelZoneFromVM(vms[0])
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(zone).To(Equal("southcentralus-1"))
+
+	// VM 2: non-zonal, different VMSize
+	g.Expect(lo.FromPtr(vms[1].Name)).To(Equal("vm-2"))
+	g.Expect(string(lo.FromPtr(vms[1].Properties.HardwareProfile.VMSize))).To(Equal("Standard_D4s_v3"))
+	g.Expect(vms[1].Zones).To(BeEmpty())
+	g.Expect(lo.FromPtr(vms[1].Location)).To(Equal("southcentralus"))
 }

@@ -260,15 +260,17 @@ func (c *CloudProvider) createFleetInstance(ctx context.Context, nodeClass *v1be
 		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating fleet instance failed, %w", err), CreateInstanceFailedReason, truncateMessage(err.Error()))
 	}
 
-	// FleetMemberPromise.VM is populated lazily inside Wait() — the LRO + VM-to-NodeClaim
-	// assignment must complete first (see fleetpromise.go). Unlike VirtualMachinePromise (where
-	// .VM is pre-populated synchronously by BeginCreate), reading fleetPromise.VM before Wait()
-	// returns nil and crashes vmInstanceToNodeClaim. We therefore gate on Wait() here.
-	if waitErr := fleetPromise.Wait(); waitErr != nil {
-		c.handleInstancePromiseWaitError(ctx, fleetPromise, nodeClaim, waitErr)
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating fleet instance failed, %w", waitErr), CreateInstanceFailedReason, truncateMessage(waitErr.Error()))
+	// ResolveAssignment is a fast, in-memory operation that reads the batch assignment
+	// and populates .VM (stub), .InstanceType, .Zone, and .ProviderID. This gives us
+	// enough data to construct the NodeClaim immediately — no network call needed.
+	if resolveErr := fleetPromise.ResolveAssignment(); resolveErr != nil {
+		return nil, cloudprovider.NewCreateError(fmt.Errorf("creating fleet instance failed, %w", resolveErr), CreateInstanceFailedReason, truncateMessage(resolveErr.Error()))
 	}
 
+	// handleInstancePromise launches a goroutine that calls fleetPromise.Wait() —
+	// which polls provisioningState every 5s for fast failure detection. On failure,
+	// the goroutine cleans up the VM and deletes the NodeClaim. This is the same
+	// async pattern used by VM and AKSMachine paths.
 	if err := c.handleInstancePromise(ctx, fleetPromise, nodeClaim); err != nil {
 		return nil, err
 	}

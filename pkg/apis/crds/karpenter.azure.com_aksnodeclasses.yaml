@@ -1010,19 +1010,19 @@ spec:
                 description: |-
                   interconnectBlockID is the full ARM resource ID of the InterconnectBlock to associate with
                   provisioned Fleet resources. Applies only to Fleet-mode provisioning.
-                pattern: (?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectBlocks\/[^\/]+$
+                pattern: (?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Compute\/interconnectBlocks\/[^\/]+$
                 type: string
               interconnectGroupID:
                 description: |-
                   interconnectGroupID is the full ARM resource ID of the InterconnectGroup to associate with
                   provisioned Fleet resources. Applies only to Fleet-mode provisioning.
-                pattern: (?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectGroups\/[^\/]+$
+                pattern: (?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/interconnectGroups\/[^\/]+$
                 type: string
               interconnectSubgroupID:
                 description: |-
                   interconnectSubgroupID is the full ARM resource ID of the InterconnectGroup subgroup to
                   associate with provisioned Fleet resources. Applies only to Fleet-mode provisioning.
-                pattern: (?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.AzureFleet\/interconnectGroups\/[^\/]+\/subgroups\/[^\/]+$
+                pattern: (?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/interconnectGroups\/[^\/]+\/subgroups\/[^\/]+$
                 type: string
               kubelet:
                 description: |-
