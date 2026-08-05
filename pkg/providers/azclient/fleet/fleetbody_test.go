@@ -58,7 +58,7 @@ func defaultFields() BatchKeyFields {
 // defaultTags returns a minimal tag map including the karpenter markers.
 func defaultTags() map[string]*string {
 	return map[string]*string{
-		"karpenter.azure.com_managed-by":    lo.ToPtr("karpenter"),
+		"karpenter.azure.com_managed-by":    lo.ToPtr("aks"),
 		"karpenter.azure.com_batch-key-hash": lo.ToPtr("abcdef0123456789"),
 	}
 }
@@ -187,7 +187,7 @@ func TestBuildFleetBody_VMSizesProfilePopulated(t *testing.T) {
 func TestBuildFleetBody_TagsCarryThrough(t *testing.T) {
 	fields := defaultFields()
 	tags := map[string]*string{
-		"karpenter.azure.com_managed-by":    lo.ToPtr("karpenter"),
+		"karpenter.azure.com_managed-by":    lo.ToPtr("aks"),
 		"karpenter.azure.com_batch-key-hash": lo.ToPtr("deadbeef12345678"),
 		"env": lo.ToPtr("test"),
 	}
