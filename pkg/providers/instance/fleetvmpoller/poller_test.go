@@ -68,6 +68,7 @@ func (m *mockVMGetter) CallCount() int {
 func testOptions() Options {
 	return Options{
 		PollInterval:  10 * time.Millisecond,
+		MaxDuration:   time.Second,
 		RetryDelay:    5 * time.Millisecond,
 		MaxRetryDelay: 20 * time.Millisecond,
 		MaxRetries:    3,
@@ -241,6 +242,64 @@ func TestPollUntilDone_ContextDeadlineExceeded(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
 		assert.ObjectsAreEqual("context canceled", err.Error()))
+}
+
+func TestPollUntilDone_ContextCancelledDuringBackoff(t *testing.T) {
+	transientErr := &azcore.ResponseError{
+		StatusCode: http.StatusServiceUnavailable,
+		ErrorCode:  "ServiceUnavailable",
+	}
+	mock := &mockVMGetter{
+		responses: []mockResponse{{err: transientErr}},
+	}
+
+	opts := testOptions()
+	opts.RetryDelay = time.Hour
+	opts.MaxRetryDelay = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := NewPoller(opts, mock, "rg", "fleet-vm-1").PollUntilDone(ctx)
+		result <- err
+	}()
+
+	require.Eventually(t, func() bool {
+		return mock.CallCount() == 1
+	}, time.Second, time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("poller did not stop after context cancellation during backoff")
+	}
+}
+
+func TestPollUntilDone_MaxDurationInterruptsBackoff(t *testing.T) {
+	transientErr := &azcore.ResponseError{
+		StatusCode: http.StatusServiceUnavailable,
+		ErrorCode:  "ServiceUnavailable",
+	}
+	mock := &mockVMGetter{
+		responses: []mockResponse{{err: transientErr}},
+	}
+
+	opts := testOptions()
+	opts.MaxDuration = 20 * time.Millisecond
+	opts.RetryDelay = time.Hour
+	opts.MaxRetryDelay = time.Hour
+
+	start := time.Now()
+	_, err := NewPoller(opts, mock, "rg", "fleet-vm-1").PollUntilDone(context.Background())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "polling exceeded maximum duration")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), time.Second)
+	assert.Equal(t, 1, mock.CallCount())
 }
 
 func TestPollUntilDone_TransientErrorRetry(t *testing.T) {
@@ -748,6 +807,7 @@ func TestExtractProvisioningError_SkipsNonErrorStatuses(t *testing.T) {
 func TestDefaultOptions(t *testing.T) {
 	opts := DefaultOptions()
 	assert.Equal(t, 5*time.Second, opts.PollInterval)
+	assert.Equal(t, 15*time.Minute, opts.MaxDuration)
 	assert.Equal(t, 1*time.Second, opts.RetryDelay)
 	assert.Equal(t, 30*time.Second, opts.MaxRetryDelay)
 	assert.Equal(t, 10, opts.MaxRetries)
@@ -756,6 +816,7 @@ func TestDefaultOptions(t *testing.T) {
 func TestInstantOptions(t *testing.T) {
 	opts := InstantOptions()
 	assert.Equal(t, 1*time.Millisecond, opts.PollInterval)
+	assert.Equal(t, time.Second, opts.MaxDuration)
 	assert.Equal(t, 1*time.Millisecond, opts.RetryDelay)
 	assert.Equal(t, 1*time.Millisecond, opts.MaxRetryDelay)
 	assert.Equal(t, 3, opts.MaxRetries)

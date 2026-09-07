@@ -45,6 +45,9 @@ type VMGetter interface {
 type Options struct {
 	// PollInterval is the interval between GET requests (default 5s).
 	PollInterval time.Duration
+	// MaxDuration is the maximum duration for the polling operation, including retry
+	// backoff (default 15m).
+	MaxDuration time.Duration
 	// RetryDelay is the initial delay before retrying after a transient error (default 1s).
 	RetryDelay time.Duration
 	// MaxRetryDelay is the maximum backoff delay (default 30s).
@@ -58,6 +61,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		PollInterval:  5 * time.Second,
+		MaxDuration:   15 * time.Minute,
 		RetryDelay:    1 * time.Second,
 		MaxRetryDelay: 30 * time.Second,
 		MaxRetries:    10,
@@ -68,6 +72,7 @@ func DefaultOptions() Options {
 func InstantOptions() Options {
 	return Options{
 		PollInterval:  1 * time.Millisecond,
+		MaxDuration:   time.Second,
 		RetryDelay:    1 * time.Millisecond,
 		MaxRetryDelay: 1 * time.Millisecond,
 		MaxRetries:    3,
@@ -96,6 +101,19 @@ func NewPoller(config Options, client VMGetter, resourceGroup, vmName string) *P
 // Returns the full VM on success (Succeeded), or an error on failure (Failed/timeout/ctx cancel).
 // The returned error wraps the provisioning failure details when available.
 func (p *Poller) PollUntilDone(ctx context.Context) (*armcompute.VirtualMachine, error) {
+	pollCtx := ctx
+	cancel := func() {}
+	if p.config.MaxDuration > 0 {
+		timeoutCause := fmt.Errorf(
+			"fleet VM %q polling exceeded maximum duration of %s: %w",
+			p.vmName,
+			p.config.MaxDuration,
+			context.DeadlineExceeded,
+		)
+		pollCtx, cancel = context.WithTimeoutCause(ctx, p.config.MaxDuration, timeoutCause)
+	}
+	defer cancel()
+
 	var retryAttemptsLeft int
 	var currentRetryDelay time.Duration
 	p.resetRetryState(&retryAttemptsLeft, &currentRetryDelay)
@@ -105,10 +123,10 @@ func (p *Poller) PollUntilDone(ctx context.Context) (*armcompute.VirtualMachine,
 
 	for {
 		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("context canceled while polling fleet VM %q: %w", p.vmName, ctx.Err())
+		case <-pollCtx.Done():
+			return nil, p.contextError(pollCtx)
 		case <-ticker.C:
-			vm, err, done := p.pollOnce(ctx, &retryAttemptsLeft, &currentRetryDelay)
+			vm, err, done := p.pollOnce(pollCtx, &retryAttemptsLeft, &currentRetryDelay)
 			if done {
 				return vm, err
 			}
@@ -143,7 +161,9 @@ func (p *Poller) pollOnce(ctx context.Context, retryAttemptsLeft *int, currentRe
 		log.FromContext(ctx).V(2).Info("fleet VM poller: unexpected provisioning state",
 			"vmName", p.vmName, "state", state, "retriesLeft", *retryAttemptsLeft)
 		if *retryAttemptsLeft > 0 {
-			p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay)
+			if backoffErr := p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay); backoffErr != nil {
+				return nil, backoffErr, true
+			}
 			return nil, nil, false
 		}
 		return nil, fmt.Errorf("fleet VM %q stuck in state %q after exhausting %d retries", p.vmName, state, p.config.MaxRetries), true
@@ -151,6 +171,9 @@ func (p *Poller) pollOnce(ctx context.Context, retryAttemptsLeft *int, currentRe
 }
 
 func (p *Poller) handleGetError(ctx context.Context, err error, retryAttemptsLeft *int, currentRetryDelay *time.Duration) (*armcompute.VirtualMachine, error, bool) {
+	if ctx.Err() != nil {
+		return nil, p.contextError(ctx), true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return nil, fmt.Errorf("failed to get fleet VM %q: %w", p.vmName, err), true
 	}
@@ -163,7 +186,9 @@ func (p *Poller) handleGetError(ctx context.Context, err error, retryAttemptsLef
 		"vmName", p.vmName, "error", err, "retriesLeft", *retryAttemptsLeft)
 
 	if *retryAttemptsLeft > 0 {
-		p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay)
+		if backoffErr := p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay); backoffErr != nil {
+			return nil, backoffErr, true
+		}
 		return nil, nil, false
 	}
 	return nil, fmt.Errorf("failed to get fleet VM %q after exhausting %d retries: %w", p.vmName, p.config.MaxRetries, err), true
@@ -174,21 +199,36 @@ func (p *Poller) handleNilProperties(ctx context.Context, retryAttemptsLeft *int
 		"vmName", p.vmName, "retriesLeft", *retryAttemptsLeft)
 
 	if *retryAttemptsLeft > 0 {
-		p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay)
+		if backoffErr := p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay); backoffErr != nil {
+			return nil, backoffErr, true
+		}
 		return nil, nil, false
 	}
 	return nil, fmt.Errorf("fleet VM %q has nil properties after exhausting %d retries", p.vmName, p.config.MaxRetries), true
 }
 
-func (p *Poller) consumeRetry(_ context.Context, retryAttemptsLeft *int, currentRetryDelay *time.Duration) {
+func (p *Poller) consumeRetry(ctx context.Context, retryAttemptsLeft *int, currentRetryDelay *time.Duration) error {
 	*retryAttemptsLeft--
-	time.Sleep(*currentRetryDelay)
-	*currentRetryDelay = min(*currentRetryDelay*2, p.config.MaxRetryDelay)
+
+	timer := time.NewTimer(*currentRetryDelay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		*currentRetryDelay = min(*currentRetryDelay*2, p.config.MaxRetryDelay)
+		return nil
+	case <-ctx.Done():
+		return p.contextError(ctx)
+	}
 }
 
 func (p *Poller) resetRetryState(retryAttemptsLeft *int, currentRetryDelay *time.Duration) {
 	*retryAttemptsLeft = p.config.MaxRetries
 	*currentRetryDelay = p.config.RetryDelay
+}
+
+func (p *Poller) contextError(ctx context.Context) error {
+	return fmt.Errorf("context ended while polling fleet VM %q: %w", p.vmName, context.Cause(ctx))
 }
 
 // isTransientError checks if an error is retryable (same logic as aksmachinepoller).

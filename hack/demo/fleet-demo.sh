@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # Fleet Launch Mode Demo — Provisions 10 nodes via Karpenter Fleet batching
-# Usage: ./hack/demo/fleet-demo.sh [step]
+# Usage: ./hack/demo/fleet-demo.sh [step] [demo-suffix]
 #   Steps: setup | deploy | provision | interconnect | observe | cleanup | all (default: all)
+#   demo-suffix: optional suffix for the default resource group name.
 set -euo pipefail
+
+STEP="${1:-all}"
+ARG_DEMO_SUFFIX="${2:-}"
 
 ###############################################################################
 # Configuration
 ###############################################################################
 export AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:-2994199d-5716-49a3-80aa-eb2ff114e431}"
-export AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-awarhekar-aks-karpenter-rg}"
 export AZURE_CLUSTER_NAME="${AZURE_CLUSTER_NAME:-karpenter}"
 export AZURE_LOCATION="${AZURE_LOCATION:-eastus2euap}"
+export DEMO_SUFFIX="${DEMO_SUFFIX:-${ARG_DEMO_SUFFIX:-$(printf '%04x%04x' "$RANDOM" "$RANDOM")}}"
+export AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-awarhekar-aks-karpenter-rg-${DEMO_SUFFIX}}"
 export AZURE_ACR_NAME="${AZURE_ACR_NAME:-awarhekarfleetacr}"
 export AZURE_ACR_URL="${AZURE_ACR_NAME}.azurecr.io"
-export AZURE_NODE_RESOURCE_GROUP="${AZURE_NODE_RESOURCE_GROUP:-MC_awarhekar-aks-karpenter-rg_karpenter_eastus2euap}"
+export AZURE_NODE_RESOURCE_GROUP="${AZURE_NODE_RESOURCE_GROUP:-MC_${AZURE_RESOURCE_GROUP}_${AZURE_CLUSTER_NAME}_${AZURE_LOCATION}}"
 export KARPENTER_MSI_NAME="${KARPENTER_MSI_NAME:-karpentermsi}"
 export KARPENTER_SA_NAME="${KARPENTER_SA_NAME:-karpenter-sa}"
 export PROVISION_MODE="fleet"
@@ -102,7 +107,26 @@ step_setup() {
     echo ""
     info "Creating resource group '$AZURE_RESOURCE_GROUP' in region '$AZURE_LOCATION'..."
     echo "  This resource group holds the AKS cluster, managed identity, and ACR."
-    az group create --name "$AZURE_RESOURCE_GROUP" --location "$AZURE_LOCATION" --output none 2>/dev/null || true
+
+    RG_STATE=$(az group show --name "$AZURE_RESOURCE_GROUP" --query "properties.provisioningState" -o tsv 2>/dev/null || true)
+    if [[ "$RG_STATE" == "Deleting" ]]; then
+        err "Resource group '$AZURE_RESOURCE_GROUP' is currently deleting and cannot be reused yet."
+        echo "  Wait for deletion to finish, or set a different resource group before rerunning:"
+        echo "    export DEMO_SUFFIX=$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+        echo "    export AZURE_RESOURCE_GROUP=awarhekar-aks-karpenter-rg-\$DEMO_SUFFIX"
+        echo "    export AZURE_NODE_RESOURCE_GROUP=MC_\${AZURE_RESOURCE_GROUP}_${AZURE_CLUSTER_NAME}_${AZURE_LOCATION}"
+        exit 1
+    fi
+    if ! az group create --name "$AZURE_RESOURCE_GROUP" --location "$AZURE_LOCATION" --output none; then
+        err "Failed to create or update resource group '$AZURE_RESOURCE_GROUP'."
+        exit 1
+    fi
+
+    RG_STATE=$(az group show --name "$AZURE_RESOURCE_GROUP" --query "properties.provisioningState" -o tsv)
+    if [[ "$RG_STATE" != "Succeeded" ]]; then
+        err "Resource group '$AZURE_RESOURCE_GROUP' is not ready. Current state: $RG_STATE"
+        exit 1
+    fi
     ok "Resource group ready."
 
     # Managed Identity for Karpenter
@@ -110,7 +134,12 @@ step_setup() {
     info "Creating managed identity '$KARPENTER_MSI_NAME' for Karpenter..."
     echo "  Karpenter uses this identity (via workload identity) to call Azure APIs"
     echo "  (Fleet, VM, NIC creation in the MC resource group)."
-    az identity create --name "$KARPENTER_MSI_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --location "$AZURE_LOCATION" --output none 2>/dev/null || true
+    if az identity show --name "$KARPENTER_MSI_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --output none 2>/dev/null; then
+        info "Managed identity already exists, skipping creation."
+    elif ! az identity create --name "$KARPENTER_MSI_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --location "$AZURE_LOCATION" --output none; then
+        err "Failed to create managed identity '$KARPENTER_MSI_NAME' in resource group '$AZURE_RESOURCE_GROUP'."
+        exit 1
+    fi
     KARPENTER_MSI_CLIENT_ID=$(az identity show --name "$KARPENTER_MSI_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query clientId -o tsv)
     KARPENTER_MSI_OBJECT_ID=$(az identity show --name "$KARPENTER_MSI_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query principalId -o tsv)
     ok "MSI ready. Client ID: $KARPENTER_MSI_CLIENT_ID"
@@ -209,6 +238,7 @@ step_setup() {
     echo ""
     ok "Infrastructure setup complete!"
     echo ""
+    echo "  Demo Suffix:        $DEMO_SUFFIX"
     echo "  Resource Group:     $AZURE_RESOURCE_GROUP"
     echo "  AKS Cluster:        $AZURE_CLUSTER_NAME"
     echo "  Node Resource Group: $AZURE_NODE_RESOURCE_GROUP"
@@ -549,7 +579,7 @@ EOF
         FLEET_NAMES=$(az rest --method GET \
             --url "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${AZURE_NODE_RESOURCE_GROUP}/providers/Microsoft.AzureFleet/fleets?api-version=2024-11-01" \
             --query "value[].name" -o tsv 2>/dev/null || echo "")
-        FLEET_CT=$(echo "$FLEET_NAMES" | grep -c . 2>/dev/null || echo 0)
+        FLEET_CT=$(echo "$FLEET_NAMES" | awk 'NF { count++ } END { print count + 0 }')
         if [[ "$FLEET_CT" -gt 0 ]]; then
             echo "    ── Fleets (${FLEET_CT}) ──"
             echo "$FLEET_NAMES" | while read -r fn; do echo "      $fn"; done
@@ -947,8 +977,6 @@ step_cleanup() {
 ###############################################################################
 # Main
 ###############################################################################
-STEP="${1:-all}"
-
 case "$STEP" in
     setup)        step_setup ;;
     deploy)       step_deploy ;;
@@ -963,7 +991,7 @@ case "$STEP" in
         step_observe
         ;;
     *)
-        echo "Usage: $0 {setup|deploy|provision|interconnect|observe|cleanup|all}"
+        echo "Usage: $0 {setup|deploy|provision|interconnect|observe|cleanup|all} [demo-suffix]"
         echo ""
         echo "Steps:"
         echo "  setup        Create Azure infra (RG, MSI, ACR, AKS, roles)"
@@ -974,6 +1002,12 @@ case "$STEP" in
         echo "  observe      Query Fleet resources, save request bodies, show VM details"
         echo "  cleanup      Remove workload and nodes"
         echo "  all          Run setup → deploy → provision → observe (no cleanup)"
+        echo ""
+        echo "Demo suffix:"
+        echo "  Optional second argument used for the default resource group name:"
+        echo "    $0 all 308232ad"
+        echo "  Equivalent environment-variable form:"
+        echo "    DEMO_SUFFIX=308232ad $0 all"
         exit 1
         ;;
 esac
