@@ -17,6 +17,7 @@ limitations under the License.
 package fleet
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -24,295 +25,336 @@ import (
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 )
 
-func spotRequest() *FleetVMProvisionRequest {
-	req := baseRequest()
-	req.CapacityType = "spot"
-	return req
-}
+const (
+	testSSHPublicKey  = "ssh-rsa AAAA..."
+	testAdminUsername = "azureuser"
+	testNSGID         = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg"
+	testLocation      = "eastus"
+)
 
-func TestBuildFleetBody_SpotProfile(t *testing.T) {
-	req := spotRequest()
-	fleet := BuildFleetBody(req, 5, nil)
-
-	require.NotNil(t, fleet.Properties.SpotPriorityProfile)
-	assert.Nil(t, fleet.Properties.RegularPriorityProfile)
-
-	spot := fleet.Properties.SpotPriorityProfile
-	assert.Equal(t, int32(5), *spot.Capacity)
-	assert.Equal(t, armcomputefleet.SpotAllocationStrategyPriceCapacityOptimized, *spot.AllocationStrategy)
-	assert.Equal(t, armcomputefleet.EvictionPolicyDelete, *spot.EvictionPolicy)
-	assert.Equal(t, false, *spot.Maintain)
-	assert.Equal(t, float32(-1), *spot.MaxPricePerVM)
-}
-
-func TestBuildFleetBody_RegularProfile(t *testing.T) {
-	req := baseRequest()
-	fleet := BuildFleetBody(req, 3, nil)
-
-	require.NotNil(t, fleet.Properties.RegularPriorityProfile)
-	assert.Nil(t, fleet.Properties.SpotPriorityProfile)
-
-	reg := fleet.Properties.RegularPriorityProfile
-	assert.Equal(t, int32(3), *reg.Capacity)
-	assert.Equal(t, armcomputefleet.RegularPriorityAllocationStrategyLowestPrice, *reg.AllocationStrategy)
-	assert.Equal(t, int32(0), *reg.MinCapacity)
-}
-
-func TestBuildFleetBody_VMSizesProfileSorted(t *testing.T) {
-	req := baseRequest()
-	req.AcceptableSKUs = []string{"Standard_D8s_v3", "Standard_D2s_v3", "Standard_D4s_v3"}
-	fleet := BuildFleetBody(req, 1, nil)
-
-	names := make([]string, len(fleet.Properties.VMSizesProfile))
-	for i, p := range fleet.Properties.VMSizesProfile {
-		names[i] = *p.Name
+func defaultLaunchTemplate() *launchtemplate.Template {
+	return &launchtemplate.Template{
+		ScriptlessCustomData: "Y3VzdG9tZGF0YQ==",
+		ImageID:              "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/i/versions/v",
+		SubnetID:             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/sn",
+		StorageProfileSizeGB: 128,
 	}
-	assert.Equal(t, []string{"Standard_D2s_v3", "Standard_D4s_v3", "Standard_D8s_v3"}, names)
 }
 
-func TestBuildFleetBody_Tags(t *testing.T) {
-	req := baseRequest()
-	tags := map[string]*string{"key1": lo.ToPtr("val1"), "key2": lo.ToPtr("val2")}
-	fleet := BuildFleetBody(req, 1, tags)
-
-	assert.Equal(t, tags, fleet.Tags)
+func defaultTags() map[string]*string {
+	return map[string]*string{
+		"karpenter.azure.com_managed-by":     lo.ToPtr("karpenter"),
+		"karpenter.azure.com_batch-key-hash": lo.ToPtr("abcdef0123456789"),
+	}
 }
 
-func TestBuildFleetBody_EncryptionAtHostNil(t *testing.T) {
-	req := baseRequest()
-	req.LaunchTemplate.EncryptionAtHost = nil
-	fleet := BuildFleetBody(req, 1, nil)
-
-	bp := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile
-	assert.Nil(t, bp.SecurityProfile)
+func defaultFleetBody(targetCapacity int32, tags map[string]*string) *armcomputefleet.Fleet {
+	return BuildFleetBody(FleetBodyOptions{
+		CapacityType:    karpv1.CapacityTypeOnDemand,
+		AcceptableSKUs:  []string{"Standard_D4s_v3", "Standard_D8s_v3"},
+		AcceptableZones: []string{"1", "2", "3"},
+		LaunchTemplate:  defaultLaunchTemplate(),
+		SSHPublicKey:    testSSHPublicKey,
+		AdminUsername:   testAdminUsername,
+		NSGID:           testNSGID,
+		Location:        testLocation,
+		TargetCapacity:  targetCapacity,
+		Tags:            tags,
+	})
 }
 
-func TestBuildFleetBody_EncryptionAtHostTrue(t *testing.T) {
-	req := baseRequest()
-	req.LaunchTemplate.EncryptionAtHost = lo.ToPtr(true)
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildFleetProperties_SpotCapacityType(t *testing.T) {
+	properties := buildFleetProperties(karpv1.CapacityTypeSpot, nil, nil, 5)
 
-	bp := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile
-	require.NotNil(t, bp.SecurityProfile)
-	assert.Equal(t, true, *bp.SecurityProfile.EncryptionAtHost)
+	require.NotNil(t, properties.SpotPriorityProfile)
+	assert.Nil(t, properties.RegularPriorityProfile)
+	assert.Equal(t, lo.ToPtr(armcomputefleet.SpotAllocationStrategyPriceCapacityOptimized), properties.SpotPriorityProfile.AllocationStrategy)
+	assert.Equal(t, lo.ToPtr(false), properties.SpotPriorityProfile.Maintain)
+	assert.Equal(t, lo.ToPtr(armcomputefleet.EvictionPolicyDelete), properties.SpotPriorityProfile.EvictionPolicy)
+	assert.Equal(t, lo.ToPtr(float32(-1)), properties.SpotPriorityProfile.MaxPricePerVM)
 }
 
-func TestBuildFleetBody_EncryptionAtHostFalse(t *testing.T) {
-	req := baseRequest()
-	req.LaunchTemplate.EncryptionAtHost = lo.ToPtr(false)
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildFleetProperties_OnDemandCapacityType(t *testing.T) {
+	properties := buildFleetProperties(karpv1.CapacityTypeOnDemand, nil, nil, 3)
 
-	bp := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile
-	assert.Nil(t, bp.SecurityProfile, "false should be treated same as nil - omitted")
+	require.NotNil(t, properties.RegularPriorityProfile)
+	assert.Nil(t, properties.SpotPriorityProfile)
+	assert.Equal(t, lo.ToPtr(armcomputefleet.RegularPriorityAllocationStrategyLowestPrice), properties.RegularPriorityProfile.AllocationStrategy)
 }
 
-func TestBuildFleetBody_DiskEncryptionSetID(t *testing.T) {
-	req := baseRequest()
-	req.DiskEncryptionSetID = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/diskEncryptionSets/des1"
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildFleetProperties_UnknownCapacityTypeDefaultsToRegular(t *testing.T) {
+	properties := buildFleetProperties("garbage-type", nil, nil, 2)
 
-	osDisk := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.OSDisk
-	require.NotNil(t, osDisk.ManagedDisk)
-	require.NotNil(t, osDisk.ManagedDisk.DiskEncryptionSet)
-	assert.Equal(t, req.DiskEncryptionSetID, *osDisk.ManagedDisk.DiskEncryptionSet.ID)
+	require.NotNil(t, properties.RegularPriorityProfile)
+	assert.Nil(t, properties.SpotPriorityProfile)
+	assert.Equal(t, int32(2), *properties.RegularPriorityProfile.Capacity)
 }
 
-func TestBuildFleetBody_NoDiskEncryptionSetID(t *testing.T) {
-	req := baseRequest()
-	req.DiskEncryptionSetID = ""
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildFleetProperties_Capacity(t *testing.T) {
+	properties := buildFleetProperties(karpv1.CapacityTypeOnDemand, nil, nil, 7)
 
-	osDisk := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.OSDisk
-	assert.Nil(t, osDisk.ManagedDisk)
+	require.NotNil(t, properties.RegularPriorityProfile.Capacity)
+	assert.Equal(t, int32(7), *properties.RegularPriorityProfile.Capacity)
 }
 
-func TestBuildFleetBody_NodeIdentities(t *testing.T) {
-	req := baseRequest()
-	req.NodeIdentities = []string{"/id/b", "/id/a"}
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildVMSizesProfile(t *testing.T) {
+	profiles := buildVMSizesProfile([]string{"Standard_D8s_v3", "Standard_D2s_v3", "Standard_D4s_v3"})
 
-	require.NotNil(t, fleet.Identity)
-	assert.Equal(t, armcomputefleet.ManagedServiceIdentityTypeUserAssigned, *fleet.Identity.Type)
-	assert.Contains(t, fleet.Identity.UserAssignedIdentities, "/id/a")
-	assert.Contains(t, fleet.Identity.UserAssignedIdentities, "/id/b")
+	require.Len(t, profiles, 3)
+	expected := []string{"Standard_D2s_v3", "Standard_D4s_v3", "Standard_D8s_v3"}
+	for i, sku := range expected {
+		assert.Equal(t, sku, *profiles[i].Name)
+		assert.Nil(t, profiles[i].Rank)
+	}
 }
 
-func TestBuildFleetBody_NetworkProfile(t *testing.T) {
-	req := baseRequest()
-	req.LBBackendPools = []string{"/pool/b", "/pool/a"}
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildFleetBody_TagsCarryThrough(t *testing.T) {
+	tags := map[string]*string{
+		"karpenter.azure.com_managed-by":     lo.ToPtr("karpenter"),
+		"karpenter.azure.com_batch-key-hash": lo.ToPtr("deadbeef12345678"),
+		"env":                                lo.ToPtr("test"),
+	}
 
-	np := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile
-	require.NotNil(t, np)
-	require.Len(t, np.NetworkInterfaceConfigurations, 1)
+	fleetBody := defaultFleetBody(1, tags)
 
-	nic := np.NetworkInterfaceConfigurations[0]
-	assert.Equal(t, true, *nic.Properties.Primary)
-	assert.Equal(t, true, *nic.Properties.EnableAcceleratedNetworking)
+	assert.Equal(t, tags, fleetBody.Tags)
+}
 
+func TestBuildFleetBody_LocationAndZones(t *testing.T) {
+	fleetBody := BuildFleetBody(FleetBodyOptions{
+		CapacityType:    karpv1.CapacityTypeOnDemand,
+		AcceptableSKUs:  []string{"Standard_D4s_v3"},
+		AcceptableZones: []string{"3", "1", "2"},
+		LaunchTemplate:  defaultLaunchTemplate(),
+		SSHPublicKey:    testSSHPublicKey,
+		AdminUsername:   testAdminUsername,
+		NSGID:           testNSGID,
+		Location:        "westus2",
+		TargetCapacity:  1,
+		Tags:            defaultTags(),
+	})
+
+	assert.Equal(t, lo.ToPtr("westus2"), fleetBody.Location)
+	require.Len(t, fleetBody.Zones, 3)
+	assert.Equal(t, "1", *fleetBody.Zones[0])
+	assert.Equal(t, "2", *fleetBody.Zones[1])
+	assert.Equal(t, "3", *fleetBody.Zones[2])
+}
+
+func TestBuildComputeProfile_EncryptionAtHost(t *testing.T) {
+	launchTemplate := defaultLaunchTemplate()
+	launchTemplate.EncryptionAtHost = lo.ToPtr(true)
+
+	profile := buildComputeProfile(FleetBodyOptions{
+		LaunchTemplate: launchTemplate,
+		SSHPublicKey:   testSSHPublicKey,
+		AdminUsername:  testAdminUsername,
+		NSGID:          testNSGID,
+	})
+
+	require.NotNil(t, profile.BaseVirtualMachineProfile.SecurityProfile)
+	assert.Equal(t, lo.ToPtr(true), profile.BaseVirtualMachineProfile.SecurityProfile.EncryptionAtHost)
+}
+
+func TestBuildComputeProfile_EncryptionAtHostDisabled(t *testing.T) {
+	launchTemplate := defaultLaunchTemplate()
+	launchTemplate.EncryptionAtHost = lo.ToPtr(false)
+
+	profile := buildComputeProfile(FleetBodyOptions{
+		LaunchTemplate: launchTemplate,
+		SSHPublicKey:   testSSHPublicKey,
+		AdminUsername:  testAdminUsername,
+		NSGID:          testNSGID,
+	})
+
+	assert.Nil(t, profile.BaseVirtualMachineProfile.SecurityProfile)
+}
+
+func TestBuildIdentity(t *testing.T) {
+	identity := buildIdentity([]string{"/sub/rg/identity2", "/sub/rg/identity1"})
+
+	require.NotNil(t, identity)
+	assert.Equal(t, lo.ToPtr(armcomputefleet.ManagedServiceIdentityTypeUserAssigned), identity.Type)
+	assert.Len(t, identity.UserAssignedIdentities, 2)
+	assert.Contains(t, identity.UserAssignedIdentities, "/sub/rg/identity1")
+	assert.Contains(t, identity.UserAssignedIdentities, "/sub/rg/identity2")
+}
+
+func TestBuildIdentity_Empty(t *testing.T) {
+	assert.Nil(t, buildIdentity(nil))
+}
+
+func TestBuildNetworkProfile(t *testing.T) {
+	launchTemplate := defaultLaunchTemplate()
+	profile := buildNetworkProfile(launchTemplate.SubnetID, testNSGID, nil)
+
+	require.Len(t, profile.NetworkInterfaceConfigurations, 1)
+	nic := profile.NetworkInterfaceConfigurations[0]
+	assert.Equal(t, lo.ToPtr(nicConfigName), nic.Name)
+	require.NotNil(t, nic.Properties)
+	assert.Equal(t, lo.ToPtr(true), nic.Properties.Primary)
+	assert.Equal(t, lo.ToPtr(true), nic.Properties.EnableAcceleratedNetworking)
+	require.Len(t, nic.Properties.IPConfigurations, 1)
 	ipConfig := nic.Properties.IPConfigurations[0]
-	assert.Equal(t, req.LaunchTemplate.SubnetID, *ipConfig.Properties.Subnet.ID)
-
-	// LB pools should be sorted
-	require.Len(t, ipConfig.Properties.LoadBalancerBackendAddressPools, 2)
-	assert.Equal(t, "/pool/a", *ipConfig.Properties.LoadBalancerBackendAddressPools[0].ID)
-	assert.Equal(t, "/pool/b", *ipConfig.Properties.LoadBalancerBackendAddressPools[1].ID)
-}
-
-func TestBuildFleetBody_NSG(t *testing.T) {
-	req := baseRequest()
-	fleet := BuildFleetBody(req, 1, nil)
-
-	nic := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations[0]
+	assert.Equal(t, lo.ToPtr(ipConfigName), ipConfig.Name)
+	assert.Equal(t, lo.ToPtr(launchTemplate.SubnetID), ipConfig.Properties.Subnet.ID)
 	require.NotNil(t, nic.Properties.NetworkSecurityGroup)
-	assert.Equal(t, req.NSG, *nic.Properties.NetworkSecurityGroup.ID)
+	assert.Equal(t, lo.ToPtr(testNSGID), nic.Properties.NetworkSecurityGroup.ID)
 }
 
-func TestBuildFleetBody_EphemeralDisk(t *testing.T) {
-	req := baseRequest()
-	req.LaunchTemplate.StorageProfileIsEphemeral = true
-	req.LaunchTemplate.StorageProfilePlacement = armcompute.DiffDiskPlacementResourceDisk
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildNetworkProfile_NoNSG(t *testing.T) {
+	profile := buildNetworkProfile(defaultLaunchTemplate().SubnetID, "", nil)
 
-	osDisk := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.OSDisk
-	require.NotNil(t, osDisk.DiffDiskSettings)
-	assert.Equal(t, armcomputefleet.DiffDiskOptionsLocal, *osDisk.DiffDiskSettings.Option)
-	assert.Equal(t, armcomputefleet.DiffDiskPlacement(armcompute.DiffDiskPlacementResourceDisk), *osDisk.DiffDiskSettings.Placement)
-	assert.Equal(t, armcomputefleet.CachingTypesReadOnly, *osDisk.Caching)
+	assert.Nil(t, profile.NetworkInterfaceConfigurations[0].Properties.NetworkSecurityGroup)
 }
 
-func TestConvertToScaleSetExtension(t *testing.T) {
-	settings := map[string]any{"commandToExecute": "echo hello"}
-	ext := &armcompute.VirtualMachineExtension{
+func TestBuildNetworkProfile_LoadBalancerPools(t *testing.T) {
+	profile := buildNetworkProfile(
+		defaultLaunchTemplate().SubnetID,
+		testNSGID,
+		[]string{"/sub/rg/lb/pool2", "/sub/rg/lb/pool1"},
+	)
+
+	ipConfig := profile.NetworkInterfaceConfigurations[0].Properties.IPConfigurations[0]
+	require.Len(t, ipConfig.Properties.LoadBalancerBackendAddressPools, 2)
+	assert.Equal(t, lo.ToPtr("/sub/rg/lb/pool1"), ipConfig.Properties.LoadBalancerBackendAddressPools[0].ID)
+	assert.Equal(t, lo.ToPtr("/sub/rg/lb/pool2"), ipConfig.Properties.LoadBalancerBackendAddressPools[1].ID)
+}
+
+func TestBuildStorageProfile_CommunityGalleryImage(t *testing.T) {
+	launchTemplate := defaultLaunchTemplate()
+
+	profile := buildStorageProfile(launchTemplate, "")
+
+	assert.Nil(t, profile.ImageReference.ID)
+	assert.Equal(t, lo.ToPtr(launchTemplate.ImageID), profile.ImageReference.CommunityGalleryImageID)
+}
+
+func TestBuildStorageProfile_EphemeralDisk(t *testing.T) {
+	launchTemplate := defaultLaunchTemplate()
+	launchTemplate.StorageProfileIsEphemeral = true
+	launchTemplate.StorageProfilePlacement = armcompute.DiffDiskPlacementCacheDisk
+
+	profile := buildStorageProfile(launchTemplate, "")
+
+	require.NotNil(t, profile.OSDisk.DiffDiskSettings)
+	assert.Equal(t, lo.ToPtr(armcomputefleet.DiffDiskOptionsLocal), profile.OSDisk.DiffDiskSettings.Option)
+	assert.Equal(t, lo.ToPtr(armcomputefleet.DiffDiskPlacementCacheDisk), profile.OSDisk.DiffDiskSettings.Placement)
+	assert.Equal(t, lo.ToPtr(armcomputefleet.CachingTypesReadOnly), profile.OSDisk.Caching)
+}
+
+func TestBuildStorageProfile_ManagedDisk(t *testing.T) {
+	profile := buildStorageProfile(defaultLaunchTemplate(), "")
+
+	assert.Nil(t, profile.OSDisk.DiffDiskSettings)
+	assert.Nil(t, profile.OSDisk.Caching)
+}
+
+func TestBuildStorageProfile_DiskEncryptionSet(t *testing.T) {
+	diskEncryptionSetID := "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/diskEncryptionSets/des"
+
+	profile := buildStorageProfile(defaultLaunchTemplate(), diskEncryptionSetID)
+
+	require.NotNil(t, profile.OSDisk.ManagedDisk)
+	require.NotNil(t, profile.OSDisk.ManagedDisk.DiskEncryptionSet)
+	assert.Equal(t, diskEncryptionSetID, *profile.OSDisk.ManagedDisk.DiskEncryptionSet.ID)
+}
+
+func TestExtensionsToProfile_Empty(t *testing.T) {
+	assert.Nil(t, extensionsToProfile(nil))
+}
+
+func TestExtensionsToProfile(t *testing.T) {
+	profile := extensionsToProfile([]*armcompute.VirtualMachineExtension{{
 		Name: lo.ToPtr("CSE"),
+		Properties: &armcompute.VirtualMachineExtensionProperties{
+			Publisher:          lo.ToPtr("Microsoft.Azure.Extensions"),
+			Type:               lo.ToPtr("CustomScript"),
+			TypeHandlerVersion: lo.ToPtr("2.1"),
+			Settings:           map[string]any{"commandToExecute": "echo hello"},
+		},
+	}})
+
+	require.NotNil(t, profile)
+	require.Len(t, profile.Extensions, 1)
+	assert.Equal(t, "echo hello", profile.Extensions[0].Properties.Settings["commandToExecute"])
+}
+
+func TestExtensionsToProfile_PointerToMap(t *testing.T) {
+	profile := extensionsToProfile([]*armcompute.VirtualMachineExtension{{
+		Name: lo.ToPtr("cse-agent-karpenter"),
 		Properties: &armcompute.VirtualMachineExtensionProperties{
 			Publisher:               lo.ToPtr("Microsoft.Azure.Extensions"),
 			Type:                    lo.ToPtr("CustomScript"),
-			TypeHandlerVersion:      lo.ToPtr("2.1"),
+			TypeHandlerVersion:      lo.ToPtr("2.0"),
 			AutoUpgradeMinorVersion: lo.ToPtr(true),
-			Settings:                settings,
-		},
-	}
-
-	result := ConvertToScaleSetExtension(ext)
-
-	assert.Equal(t, "CSE", *result.Name)
-	assert.Equal(t, "Microsoft.Azure.Extensions", *result.Properties.Publisher)
-	assert.Equal(t, "CustomScript", *result.Properties.Type)
-	assert.Equal(t, "2.1", *result.Properties.TypeHandlerVersion)
-	assert.Equal(t, true, *result.Properties.AutoUpgradeMinorVersion)
-	assert.Equal(t, settings, result.Properties.Settings)
-}
-
-func TestConvertToScaleSetExtension_NilInput(t *testing.T) {
-	result := ConvertToScaleSetExtension(nil)
-	assert.NotNil(t, result)
-	assert.Nil(t, result.Properties)
-}
-
-func TestBuildFleetBody_Zones(t *testing.T) {
-	req := baseRequest()
-	req.AcceptableZones = []string{"3", "1"}
-	fleet := BuildFleetBody(req, 1, nil)
-
-	require.Len(t, fleet.Zones, 2)
-	assert.Equal(t, "1", *fleet.Zones[0])
-	assert.Equal(t, "3", *fleet.Zones[1])
-}
-
-func TestBuildFleetBody_NoZones(t *testing.T) {
-	req := baseRequest()
-	req.AcceptableZones = nil
-	fleet := BuildFleetBody(req, 1, nil)
-
-	assert.Nil(t, fleet.Zones)
-}
-
-func TestBuildFleetBody_CustomData(t *testing.T) {
-	req := baseRequest()
-	req.LaunchTemplate = &launchtemplate.Template{
-		ImageID:              "/image",
-		SubnetID:             "/subnet",
-		ScriptlessCustomData: "base-custom-data",
-		StorageProfileSizeGB: 128,
-	}
-	fleet := BuildFleetBody(req, 1, nil)
-
-	osProfile := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.OSProfile
-	assert.Equal(t, "base-custom-data", *osProfile.CustomData)
-}
-
-func TestBuildFleetBody_CustomScriptsCustomDataOverrides(t *testing.T) {
-	req := baseRequest()
-	req.LaunchTemplate = &launchtemplate.Template{
-		ImageID:                 "/image",
-		SubnetID:                "/subnet",
-		ScriptlessCustomData:    "base-custom-data",
-		CustomScriptsCustomData: "custom-scripts-data",
-		StorageProfileSizeGB:    128,
-	}
-	fleet := BuildFleetBody(req, 1, nil)
-
-	osProfile := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.OSProfile
-	assert.Equal(t, "custom-scripts-data", *osProfile.CustomData)
-}
-
-func TestBuildFleetBody_ExtensionsViaProfile(t *testing.T) {
-	req := baseRequest()
-	settings := map[string]any{"cmd": "echo hi"}
-	req.Extensions = []*armcompute.VirtualMachineExtension{
-		{
-			Name: lo.ToPtr("ext1"),
-			Properties: &armcompute.VirtualMachineExtensionProperties{
-				Publisher:          lo.ToPtr("Microsoft.Azure.Extensions"),
-				Type:               lo.ToPtr("CustomScript"),
-				TypeHandlerVersion: lo.ToPtr("2.1"),
-				Settings:           settings,
+			Settings:                &map[string]interface{}{},
+			ProtectedSettings: &map[string]interface{}{
+				"commandToExecute": "echo bootstrap",
 			},
 		},
-		nil, // should be skipped
-		{
-			Name: lo.ToPtr("ext2"),
-			Properties: &armcompute.VirtualMachineExtensionProperties{
-				Publisher: lo.ToPtr("Microsoft.Compute"),
-				Type:      lo.ToPtr("BGInfo"),
-			},
-		},
-	}
-	fleet := BuildFleetBody(req, 1, nil)
+	}})
 
-	ep := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.ExtensionProfile
-	require.NotNil(t, ep)
-	assert.Len(t, ep.Extensions, 2)
-	assert.Equal(t, "ext1", *ep.Extensions[0].Name)
-	assert.Equal(t, "ext2", *ep.Extensions[1].Name)
+	require.NotNil(t, profile)
+	extension := profile.Extensions[0]
+	assert.Equal(t, "cse-agent-karpenter", *extension.Name)
+	assert.Equal(t, "Microsoft.Azure.Extensions", *extension.Properties.Publisher)
+	assert.Equal(t, "CustomScript", *extension.Properties.Type)
+	assert.Equal(t, "echo bootstrap", extension.Properties.ProtectedSettings["commandToExecute"])
 }
 
-func TestBuildFleetBody_EmptyIdentitiesSkipped(t *testing.T) {
-	req := baseRequest()
-	req.NodeIdentities = []string{"", ""}
-	fleet := BuildFleetBody(req, 1, nil)
+func TestBuildFleetBody_RoundTripMarshal(t *testing.T) {
+	launchTemplate := defaultLaunchTemplate()
+	launchTemplate.StorageProfileIsEphemeral = true
+	launchTemplate.StorageProfilePlacement = armcompute.DiffDiskPlacementCacheDisk
+	launchTemplate.EncryptionAtHost = lo.ToPtr(true)
+	diskEncryptionSetID := "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/diskEncryptionSets/des"
 
-	assert.Nil(t, fleet.Identity, "all-empty identity list should produce nil identity")
-}
+	original := BuildFleetBody(FleetBodyOptions{
+		CapacityType:        karpv1.CapacityTypeSpot,
+		AcceptableSKUs:      []string{"Standard_D4s_v3", "Standard_D8s_v3"},
+		AcceptableZones:     []string{"1", "2", "3"},
+		LaunchTemplate:      launchTemplate,
+		SSHPublicKey:        testSSHPublicKey,
+		AdminUsername:       testAdminUsername,
+		NodeIdentities:      []string{"/sub/rg/id1", "/sub/rg/id2"},
+		DiskEncryptionSetID: diskEncryptionSetID,
+		NSGID:               testNSGID,
+		LBBackendPools:      []string{"/sub/rg/lb/pool1"},
+		Location:            "eastus2",
+		TargetCapacity:      5,
+		Tags:                defaultTags(),
+	})
 
-func TestToMapStringAny_PointerMap(t *testing.T) {
-	m := map[string]interface{}{"key": "value"}
-	result := toMapStringAny(&m)
-	assert.Equal(t, map[string]any{"key": "value"}, result)
-}
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+	require.NotEmpty(t, data)
 
-func TestToMapStringAny_NilPointer(t *testing.T) {
-	var m *map[string]interface{}
-	result := toMapStringAny(m)
-	assert.Nil(t, result)
-}
+	var roundTripped armcomputefleet.Fleet
+	require.NoError(t, json.Unmarshal(data, &roundTripped))
 
-func TestToMapStringAny_UnknownType(t *testing.T) {
-	result := toMapStringAny("not a map")
-	assert.Nil(t, result)
+	assert.Equal(t, *original.Location, *roundTripped.Location)
+	assert.Equal(t, len(original.Zones), len(roundTripped.Zones))
+	assert.Equal(t, len(original.Tags), len(roundTripped.Tags))
+	require.NotNil(t, roundTripped.Identity)
+	assert.Equal(t, *original.Identity.Type, *roundTripped.Identity.Type)
+	assert.Equal(t, len(original.Identity.UserAssignedIdentities), len(roundTripped.Identity.UserAssignedIdentities))
+	require.NotNil(t, roundTripped.Properties.SpotPriorityProfile)
+	assert.Equal(t, *original.Properties.SpotPriorityProfile.Capacity, *roundTripped.Properties.SpotPriorityProfile.Capacity)
+	assert.Equal(t, len(original.Properties.VMSizesProfile), len(roundTripped.Properties.VMSizesProfile))
+
+	osDisk := roundTripped.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.OSDisk
+	require.NotNil(t, osDisk.DiffDiskSettings)
+	require.NotNil(t, osDisk.ManagedDisk)
+	assert.Equal(t, diskEncryptionSetID, *osDisk.ManagedDisk.DiskEncryptionSet.ID)
+	require.NotNil(t, roundTripped.Properties.ComputeProfile.BaseVirtualMachineProfile.SecurityProfile)
+
+	ipConfig := roundTripped.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.
+		NetworkInterfaceConfigurations[0].Properties.IPConfigurations[0]
+	require.Len(t, ipConfig.Properties.LoadBalancerBackendAddressPools, 1)
 }
