@@ -346,6 +346,48 @@ func TestPollUntilDone_MultipleTransientErrorsThenSuccess(t *testing.T) {
 	assert.Equal(t, 3, mock.CallCount())
 }
 
+func TestPollUntilDone_NotFoundBeforeVisibleRetries(t *testing.T) {
+	notFoundErr := &azcore.ResponseError{
+		StatusCode: http.StatusNotFound,
+		ErrorCode:  "ResourceNotFound",
+	}
+
+	mock := &mockVMGetter{
+		responses: []mockResponse{
+			{err: notFoundErr}, // VM creation not yet visible via GET
+			{err: notFoundErr}, // still not visible
+			{vm: vmWithState("Creating")},
+			{vm: vmWithState("Succeeded")},
+		},
+	}
+
+	poller := NewPoller(testOptions(), mock, "rg", "fleet-vm-1")
+	vm, err := poller.PollUntilDone(context.Background())
+
+	require.NoError(t, err)
+	assert.NotNil(t, vm)
+	assert.Equal(t, 4, mock.CallCount())
+}
+
+func TestPollUntilDone_NotFoundBeforeVisibleExhaustsRetries(t *testing.T) {
+	notFoundErr := &azcore.ResponseError{
+		StatusCode: http.StatusNotFound,
+		ErrorCode:  "ResourceNotFound",
+	}
+
+	mock := &mockVMGetter{
+		responses: []mockResponse{
+			{err: notFoundErr}, // VM never becomes visible
+		},
+	}
+
+	poller := NewPoller(testOptions(), mock, "rg", "fleet-vm-1")
+	_, err := poller.PollUntilDone(context.Background())
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exhausting")
+}
+
 func TestPollUntilDone_NonTransientErrorFailsImmediately(t *testing.T) {
 	notFoundErr := &azcore.ResponseError{
 		StatusCode: http.StatusNotFound,

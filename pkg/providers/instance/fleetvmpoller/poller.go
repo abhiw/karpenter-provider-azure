@@ -85,6 +85,13 @@ type Poller struct {
 	client        VMGetter
 	resourceGroup string
 	vmName        string
+
+	// everObserved is set once a GET call returns the VM with non-nil properties,
+	// i.e. the VM has become visible via the API at least once. Used to distinguish
+	// "not yet visible" 404s (retryable, since Fleet creation may not have propagated
+	// to this GET path yet) from "was visible, now gone" 404s (terminal, likely
+	// deleted mid-flight).
+	everObserved bool
 }
 
 // NewPoller creates a poller for a specific Fleet VM.
@@ -145,6 +152,8 @@ func (p *Poller) pollOnce(ctx context.Context, retryAttemptsLeft *int, currentRe
 		return p.handleNilProperties(ctx, retryAttemptsLeft, currentRetryDelay)
 	}
 
+	p.everObserved = true
+
 	state := lo.FromPtr(vm.Properties.ProvisioningState)
 	switch state {
 	case "Succeeded":
@@ -159,11 +168,12 @@ func (p *Poller) pollOnce(ctx context.Context, retryAttemptsLeft *int, currentRe
 	default:
 		// Nil or unrecognized state: retry with backoff
 		log.FromContext(ctx).V(2).Info("fleet VM poller: unexpected provisioning state",
-			"vmName", p.vmName, "state", state, "retriesLeft", *retryAttemptsLeft)
-		if *retryAttemptsLeft > 0 {
-			if backoffErr := p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay); backoffErr != nil {
-				return nil, backoffErr, true
-			}
+			"vmName", p.vmName, "state", state, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
+		shouldRetry, backoffErr := p.retryWithBackoff(ctx, retryAttemptsLeft, currentRetryDelay)
+		if backoffErr != nil {
+			return nil, backoffErr, true
+		}
+		if shouldRetry {
 			return nil, nil, false
 		}
 		return nil, fmt.Errorf("fleet VM %q stuck in state %q after exhausting %d retries", p.vmName, state, p.config.MaxRetries), true
@@ -178,17 +188,28 @@ func (p *Poller) handleGetError(ctx context.Context, err error, retryAttemptsLef
 		return nil, fmt.Errorf("failed to get fleet VM %q: %w", p.vmName, err), true
 	}
 
-	if !isTransientError(err) {
+	// A 404 before the VM has ever been observed likely means Fleet's creation hasn't
+	// propagated to this GET path yet - retry it like any other transient error.
+	// A 404 after the VM was previously observed likely means it was deleted
+	// mid-flight, and remains terminal/non-retryable.
+	notFoundBeforeVisible := isNotFoundError(err) && !p.everObserved
+	if !isTransientError(err) && !notFoundBeforeVisible {
 		return nil, fmt.Errorf("non-retryable error getting fleet VM %q: %w", p.vmName, err), true
 	}
 
-	log.FromContext(ctx).V(2).Info("fleet VM poller: transient GET error, may retry",
-		"vmName", p.vmName, "error", err, "retriesLeft", *retryAttemptsLeft)
+	if notFoundBeforeVisible {
+		log.FromContext(ctx).V(2).Info("fleet VM poller: VM not found yet, likely not propagated to GET path, may retry",
+			"vmName", p.vmName, "error", err, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
+	} else {
+		log.FromContext(ctx).V(2).Info("fleet VM poller: transient GET error, may retry",
+			"vmName", p.vmName, "error", err, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
+	}
 
-	if *retryAttemptsLeft > 0 {
-		if backoffErr := p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay); backoffErr != nil {
-			return nil, backoffErr, true
-		}
+	shouldRetry, backoffErr := p.retryWithBackoff(ctx, retryAttemptsLeft, currentRetryDelay)
+	if backoffErr != nil {
+		return nil, backoffErr, true
+	}
+	if shouldRetry {
 		return nil, nil, false
 	}
 	return nil, fmt.Errorf("failed to get fleet VM %q after exhausting %d retries: %w", p.vmName, p.config.MaxRetries, err), true
@@ -196,18 +217,26 @@ func (p *Poller) handleGetError(ctx context.Context, err error, retryAttemptsLef
 
 func (p *Poller) handleNilProperties(ctx context.Context, retryAttemptsLeft *int, currentRetryDelay *time.Duration) (*armcompute.VirtualMachine, error, bool) {
 	log.FromContext(ctx).V(1).Info("fleet VM poller: nil properties on GET response",
-		"vmName", p.vmName, "retriesLeft", *retryAttemptsLeft)
+		"vmName", p.vmName, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
 
-	if *retryAttemptsLeft > 0 {
-		if backoffErr := p.consumeRetry(ctx, retryAttemptsLeft, currentRetryDelay); backoffErr != nil {
-			return nil, backoffErr, true
-		}
+	shouldRetry, backoffErr := p.retryWithBackoff(ctx, retryAttemptsLeft, currentRetryDelay)
+	if backoffErr != nil {
+		return nil, backoffErr, true
+	}
+	if shouldRetry {
 		return nil, nil, false
 	}
 	return nil, fmt.Errorf("fleet VM %q has nil properties after exhausting %d retries", p.vmName, p.config.MaxRetries), true
 }
 
-func (p *Poller) consumeRetry(ctx context.Context, retryAttemptsLeft *int, currentRetryDelay *time.Duration) error {
+// retryWithBackoff applies exponential backoff and returns true if retry should continue, false if exhausted.
+// It decrements retryAttemptsLeft, sleeps with exponential backoff, and updates currentRetryDelay.
+// Mirrors aksmachinepoller's retryWithBackoff for consistent behavior across both pollers.
+func (p *Poller) retryWithBackoff(ctx context.Context, retryAttemptsLeft *int, currentRetryDelay *time.Duration) (shouldRetry bool, err error) {
+	if *retryAttemptsLeft <= 0 {
+		return false, nil
+	}
+
 	*retryAttemptsLeft--
 
 	timer := time.NewTimer(*currentRetryDelay)
@@ -216,9 +245,9 @@ func (p *Poller) consumeRetry(ctx context.Context, retryAttemptsLeft *int, curre
 	select {
 	case <-timer.C:
 		*currentRetryDelay = min(*currentRetryDelay*2, p.config.MaxRetryDelay)
-		return nil
+		return true, nil
 	case <-ctx.Done():
-		return p.contextError(ctx)
+		return false, p.contextError(ctx)
 	}
 }
 
@@ -252,6 +281,15 @@ func isTransientError(err error) bool {
 	}
 	// Network errors, timeouts, etc. are transient
 	return true
+}
+
+// isNotFoundError determines if an error is an HTTP 404 (Not Found) response.
+func isNotFoundError(err error) bool {
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.StatusCode == http.StatusNotFound
+	}
+	return false
 }
 
 // extractProvisioningError extracts a human-readable error from a failed VM's instanceView.
