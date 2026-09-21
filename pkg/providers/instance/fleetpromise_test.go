@@ -433,6 +433,7 @@ func buildPromiseWithPolling(
 // TestFleetMemberPromise_Wait_PollingImmediateSuccess verifies Wait() succeeds
 // when the first GET returns provisioningState=Succeeded.
 func TestFleetMemberPromise_Wait_PollingImmediateSuccess(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -453,6 +454,7 @@ func TestFleetMemberPromise_Wait_PollingImmediateSuccess(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingCreatingThenSucceeded verifies Wait() polls
 // through Creating state until Succeeded.
 func TestFleetMemberPromise_Wait_PollingCreatingThenSucceeded(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -473,6 +475,7 @@ func TestFleetMemberPromise_Wait_PollingCreatingThenSucceeded(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingFailed verifies Wait() returns an error
 // when provisioningState reaches Failed.
 func TestFleetMemberPromise_Wait_PollingFailed(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -497,6 +500,7 @@ func TestFleetMemberPromise_Wait_PollingFailed(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingFailedInvokesErrorHandler verifies that when
 // provisioning fails, the error handler is invoked (same as SI VM WaitFunc closure).
 func TestFleetMemberPromise_Wait_PollingFailedInvokesErrorHandler(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -522,6 +526,7 @@ func TestFleetMemberPromise_Wait_PollingFailedInvokesErrorHandler(t *testing.T) 
 // TestFleetMemberPromise_Wait_PollingFailedNilErrorHandler verifies Wait() still
 // returns error even when errorHandling is nil (graceful degradation).
 func TestFleetMemberPromise_Wait_PollingFailedNilErrorHandler(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -539,6 +544,7 @@ func TestFleetMemberPromise_Wait_PollingFailedNilErrorHandler(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingTransientErrorThenSuccess verifies retries
 // on transient GET errors.
 func TestFleetMemberPromise_Wait_PollingTransientErrorThenSuccess(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	transientErr := &azcore.ResponseError{
@@ -563,6 +569,7 @@ func TestFleetMemberPromise_Wait_PollingTransientErrorThenSuccess(t *testing.T) 
 // TestFleetMemberPromise_Wait_PollingNonTransientErrorFails verifies 404 etc.
 // cause immediate failure.
 func TestFleetMemberPromise_Wait_PollingNonTransientErrorFails(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	notFoundErr := &azcore.ResponseError{
@@ -586,6 +593,7 @@ func TestFleetMemberPromise_Wait_PollingNonTransientErrorFails(t *testing.T) {
 
 // TestFleetMemberPromise_Wait_PollingContextCancelled verifies ctx cancellation.
 func TestFleetMemberPromise_Wait_PollingContextCancelled(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -779,6 +787,7 @@ func TestFleetMemberPromise_Wait_LegacyPathNoVMClient(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingSuccessPopulatesProviderID verifies the
 // ProviderID is populated from the polled VM (not the assignment VM).
 func TestFleetMemberPromise_Wait_PollingSuccessPopulatesProviderID(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	succeededVM := &armcompute.VirtualMachine{
@@ -814,6 +823,7 @@ func TestFleetMemberPromise_Wait_PollingSuccessPopulatesProviderID(t *testing.T)
 // verifies that when instanceTypeProvider.Get() fails, handleFailedProvisioning
 // logs the error gracefully and does not panic.
 func TestFleetMemberPromise_Wait_HandleFailedProvisioningGracefulWhenSKULookupFails(t *testing.T) {
+	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{

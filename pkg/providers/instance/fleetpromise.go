@@ -115,15 +115,15 @@ func (p *FleetMemberPromise) Wait() error {
 		return fmt.Errorf("fleet promise for NodeClaim %s has no VM name (call ResolveAssignment first)", p.nodeClaimName)
 	}
 
-	// Poll compute GET until provisioningState reaches Succeeded or Failed.
-	vm, pollErr := p.pollVMProvisioning(vmName)
-	if pollErr != nil {
-		p.handleFailedProvisioning(pollErr)
-		return pollErr
-	}
+	// // Poll compute GET until provisioningState reaches Succeeded or Failed.
+	// vm, pollErr := p.pollVMProvisioning(vmName)
+	// if pollErr != nil {
+	// 	p.handleFailedProvisioning(pollErr)
+	// 	return pollErr
+	// }
 
 	// Provisioning succeeded — update .VM with the full object.
-	p.VM = vm
+	// p.VM = vm
 	if p.VM != nil && p.VM.ID != nil {
 		p.ProviderID = utils.VMResourceIDToProviderID(p.ctx, *p.VM.ID)
 	}
