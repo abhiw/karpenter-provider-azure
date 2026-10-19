@@ -105,6 +105,123 @@ func vmWithFailedStateAndInstanceView(errorCode, errorMsg string) *armcompute.Vi
 
 // --- Tests for PollUntilDone ---
 
+func TestDefaultOptions_ErrorWindows(t *testing.T) {
+	opts := DefaultOptions()
+	assert.Equal(t, 20*time.Second, opts.NotFoundTimeout)
+	assert.Equal(t, 2*time.Minute, opts.ErrorTimeout)
+	assert.Equal(t, 15*time.Minute, opts.MaxDuration)
+}
+
+func TestPollUntilDone_ErrorWindowInterruptsBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response mockResponse
+		notFound bool
+	}{
+		{"not-found", mockResponse{err: &azcore.ResponseError{StatusCode: 404}}, true},
+		{"throttled", mockResponse{err: &azcore.ResponseError{StatusCode: 429}}, false},
+		{"unavailable", mockResponse{err: &azcore.ResponseError{StatusCode: 503}}, false},
+		{"network", mockResponse{err: errors.New("connection failed")}, false},
+		{"nil-properties", mockResponse{vm: &armcompute.VirtualMachine{}}, false},
+		{"unknown-state", mockResponse{vm: vmWithState("")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := testOptions()
+			opts.NotFoundTimeout = 20 * time.Millisecond
+			opts.ErrorTimeout = 60 * time.Millisecond
+			opts.RetryDelay = time.Hour
+			opts.MaxRetryDelay = time.Hour
+			mock := &mockVMGetter{responses: []mockResponse{tc.response}}
+			start := time.Now()
+			_, err := NewPoller(opts, mock, "rg", "vm").PollUntilDone(context.Background())
+			require.ErrorContains(t, err, "error retry window")
+			if tc.notFound {
+				assert.Contains(t, err.Error(), "20ms")
+			} else {
+				assert.Contains(t, err.Error(), "60ms")
+			}
+			if tc.response.err != nil {
+				assert.ErrorIs(t, err, tc.response.err)
+			}
+			assert.GreaterOrEqual(t, time.Since(start), opts.NotFoundTimeout)
+			assert.Less(t, time.Since(start), time.Second)
+			assert.Equal(t, 1, mock.CallCount())
+		})
+	}
+}
+
+func TestPollUntilDone_HealthyStateResetsErrorWindow(t *testing.T) {
+	opts := testOptions()
+	opts.ErrorTimeout = 50 * time.Millisecond
+	mock := &mockVMGetter{responses: []mockResponse{
+		{err: errors.New("temporary failure")},
+		{vm: vmWithState("Creating")},
+		{vm: vmWithState("Updating")},
+		{vm: vmWithState("Creating")},
+		{vm: vmWithState("Updating")},
+		{vm: vmWithState("Creating")},
+		{vm: vmWithState("Succeeded")},
+	}}
+	_, err := NewPoller(opts, mock, "rg", "vm").PollUntilDone(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 7, mock.CallCount())
+}
+
+func TestPollUntilDone_RepeatedErrorsDoNotExtendWindow(t *testing.T) {
+	opts := testOptions()
+	opts.ErrorTimeout = 50 * time.Millisecond
+	opts.MaxRetries = 100
+	mock := &mockVMGetter{responses: []mockResponse{
+		{err: &azcore.ResponseError{StatusCode: 503}},
+	}}
+	start := time.Now()
+	_, err := NewPoller(opts, mock, "rg", "vm").PollUntilDone(context.Background())
+	require.ErrorContains(t, err, "error retry window of 50ms expired")
+	assert.Greater(t, mock.CallCount(), 1)
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+func TestPollUntilDone_NotFoundTightensExistingErrorWindow(t *testing.T) {
+	opts := testOptions()
+	opts.NotFoundTimeout = 20 * time.Millisecond
+	opts.ErrorTimeout = 200 * time.Millisecond
+	notFound := &azcore.ResponseError{StatusCode: 404}
+	mock := &mockVMGetter{responses: []mockResponse{
+		{err: &azcore.ResponseError{StatusCode: 503}},
+		{err: notFound},
+	}}
+	_, err := NewPoller(opts, mock, "rg", "vm").PollUntilDone(context.Background())
+	require.ErrorContains(t, err, "error retry window of 20ms expired")
+	assert.ErrorIs(t, err, notFound)
+}
+
+type vmGetterFunc func(context.Context) (armcompute.VirtualMachinesClientGetResponse, error)
+
+func (f vmGetterFunc) Get(ctx context.Context, _, _ string, _ *armcompute.VirtualMachinesClientGetOptions) (armcompute.VirtualMachinesClientGetResponse, error) {
+	return f(ctx)
+}
+
+func TestPollUntilDone_ErrorWindowInterruptsNextGET(t *testing.T) {
+	opts := testOptions()
+	opts.NotFoundTimeout = 40 * time.Millisecond
+	notFound := &azcore.ResponseError{StatusCode: 404}
+	calls := 0
+	getter := vmGetterFunc(func(ctx context.Context) (armcompute.VirtualMachinesClientGetResponse, error) {
+		calls++
+		if calls == 1 {
+			return armcompute.VirtualMachinesClientGetResponse{}, notFound
+		}
+		<-ctx.Done()
+		return armcompute.VirtualMachinesClientGetResponse{}, ctx.Err()
+	})
+	start := time.Now()
+	_, err := NewPoller(opts, getter, "rg", "vm").PollUntilDone(context.Background())
+	require.ErrorContains(t, err, "error retry window of 40ms expired")
+	assert.ErrorIs(t, err, notFound)
+	assert.Equal(t, 2, calls)
+	assert.Less(t, time.Since(start), time.Second)
+}
+
 func TestPollUntilDone_ImmediateSuccess(t *testing.T) {
 	mock := &mockVMGetter{
 		responses: []mockResponse{

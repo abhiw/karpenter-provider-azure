@@ -43,6 +43,10 @@ type VMGetter interface {
 
 // Options contains configuration for polling. Aligned with aksmachinepoller defaults.
 type Options struct {
+	// NotFoundTimeout bounds initial-404 retries from the first not-found response.
+	NotFoundTimeout time.Duration
+	// ErrorTimeout bounds a consecutive error streak, including GETs and backoff.
+	ErrorTimeout time.Duration
 	// PollInterval is the interval between GET requests (default 5s).
 	PollInterval time.Duration
 	// MaxDuration is the maximum duration for the polling operation, including retry
@@ -60,11 +64,13 @@ type Options struct {
 // DefaultOptions returns production poller configuration (same as aksmachinepoller).
 func DefaultOptions() Options {
 	return Options{
-		PollInterval:  5 * time.Second,
-		MaxDuration:   15 * time.Minute,
-		RetryDelay:    1 * time.Second,
-		MaxRetryDelay: 30 * time.Second,
-		MaxRetries:    10,
+		NotFoundTimeout: 20 * time.Second,
+		ErrorTimeout:    2 * time.Minute,
+		PollInterval:    5 * time.Second,
+		MaxDuration:     15 * time.Minute,
+		RetryDelay:      1 * time.Second,
+		MaxRetryDelay:   30 * time.Second,
+		MaxRetries:      10,
 	}
 }
 
@@ -92,10 +98,18 @@ type Poller struct {
 	// to this GET path yet) from "was visible, now gone" 404s (terminal, likely
 	// deleted mid-flight).
 	everObserved bool
+	retryContext context.Context
+	retryCancel  context.CancelFunc
 }
 
 // NewPoller creates a poller for a specific Fleet VM.
 func NewPoller(config Options, client VMGetter, resourceGroup, vmName string) *Poller {
+	if config.NotFoundTimeout <= 0 {
+		config.NotFoundTimeout = 20 * time.Second
+	}
+	if config.ErrorTimeout <= 0 {
+		config.ErrorTimeout = 2 * time.Minute
+	}
 	return &Poller{
 		config:        config,
 		client:        client,
@@ -120,6 +134,7 @@ func (p *Poller) PollUntilDone(ctx context.Context) (*armcompute.VirtualMachine,
 		pollCtx, cancel = context.WithTimeoutCause(ctx, p.config.MaxDuration, timeoutCause)
 	}
 	defer cancel()
+	defer p.clearErrorWindow()
 
 	var retryAttemptsLeft int
 	var currentRetryDelay time.Duration
@@ -129,11 +144,18 @@ func (p *Poller) PollUntilDone(ctx context.Context) (*armcompute.VirtualMachine,
 	defer ticker.Stop()
 
 	for {
+		activeCtx := pollCtx
+		if p.retryContext != nil {
+			activeCtx = p.retryContext
+		}
 		select {
-		case <-pollCtx.Done():
-			return nil, p.contextError(pollCtx)
+		case <-activeCtx.Done():
+			return nil, p.contextError(activeCtx)
 		case <-ticker.C:
-			vm, err, done := p.pollOnce(pollCtx, &retryAttemptsLeft, &currentRetryDelay)
+			if activeCtx.Err() != nil {
+				return nil, p.contextError(activeCtx)
+			}
+			vm, err, done := p.pollOnce(activeCtx, &retryAttemptsLeft, &currentRetryDelay)
 			if done {
 				return vm, err
 			}
@@ -166,6 +188,7 @@ func (p *Poller) pollOnce(ctx context.Context, retryAttemptsLeft *int, currentRe
 		p.resetRetryState(retryAttemptsLeft, currentRetryDelay)
 		return nil, nil, false
 	default:
+		p.startErrorWindow(ctx, fmt.Errorf("unexpected provisioning state %q", state), p.config.ErrorTimeout)
 		// Nil or unrecognized state: retry with backoff
 		log.FromContext(ctx).V(2).Info("fleet VM poller: unexpected provisioning state",
 			"vmName", p.vmName, "state", state, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
@@ -188,8 +211,8 @@ func (p *Poller) handleGetError(ctx context.Context, err error, retryAttemptsLef
 		return nil, fmt.Errorf("failed to get fleet VM %q: %w", p.vmName, err), true
 	}
 
-	// A 404 before the VM has ever been observed likely means Fleet's creation hasn't
-	// propagated to this GET path yet - retry it like any other transient error.
+	// A 404 before the VM has ever been observed may be a propagation delay.
+	// Retry within the shorter visibility window without treating it as quota.
 	// A 404 after the VM was previously observed likely means it was deleted
 	// mid-flight, and remains terminal/non-retryable.
 	notFoundBeforeVisible := isNotFoundError(err) && !p.everObserved
@@ -198,9 +221,11 @@ func (p *Poller) handleGetError(ctx context.Context, err error, retryAttemptsLef
 	}
 
 	if notFoundBeforeVisible {
+		p.startErrorWindow(ctx, err, p.config.NotFoundTimeout)
 		log.FromContext(ctx).V(2).Info("fleet VM poller: VM not found yet, likely not propagated to GET path, may retry",
 			"vmName", p.vmName, "error", err, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
 	} else {
+		p.startErrorWindow(ctx, err, p.config.ErrorTimeout)
 		log.FromContext(ctx).V(2).Info("fleet VM poller: transient GET error, may retry",
 			"vmName", p.vmName, "error", err, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
 	}
@@ -216,6 +241,7 @@ func (p *Poller) handleGetError(ctx context.Context, err error, retryAttemptsLef
 }
 
 func (p *Poller) handleNilProperties(ctx context.Context, retryAttemptsLeft *int, currentRetryDelay *time.Duration) (*armcompute.VirtualMachine, error, bool) {
+	p.startErrorWindow(ctx, fmt.Errorf("VM properties are nil"), p.config.ErrorTimeout)
 	log.FromContext(ctx).V(1).Info("fleet VM poller: nil properties on GET response",
 		"vmName", p.vmName, "retriesLeft", *retryAttemptsLeft, "retryDelay", *currentRetryDelay)
 
@@ -233,6 +259,9 @@ func (p *Poller) handleNilProperties(ctx context.Context, retryAttemptsLeft *int
 // It decrements retryAttemptsLeft, sleeps with exponential backoff, and updates currentRetryDelay.
 // Mirrors aksmachinepoller's retryWithBackoff for consistent behavior across both pollers.
 func (p *Poller) retryWithBackoff(ctx context.Context, retryAttemptsLeft *int, currentRetryDelay *time.Duration) (shouldRetry bool, err error) {
+	if p.retryContext != nil {
+		ctx = p.retryContext
+	}
 	if *retryAttemptsLeft <= 0 {
 		return false, nil
 	}
@@ -252,8 +281,38 @@ func (p *Poller) retryWithBackoff(ctx context.Context, retryAttemptsLeft *int, c
 }
 
 func (p *Poller) resetRetryState(retryAttemptsLeft *int, currentRetryDelay *time.Duration) {
+	p.clearErrorWindow()
 	*retryAttemptsLeft = p.config.MaxRetries
 	*currentRetryDelay = p.config.RetryDelay
+}
+
+func (p *Poller) startErrorWindow(ctx context.Context, err error, duration time.Duration) {
+	deadline := time.Now().Add(duration)
+	if p.retryContext != nil {
+		if current, ok := p.retryContext.Deadline(); ok && !deadline.Before(current) {
+			return
+		}
+	}
+	cause := fmt.Errorf("fleet VM %q error retry window of %s expired: %w", p.vmName, duration, err)
+	// Keep the previous context alive when tightening its deadline, since the new
+	// context inherits cancellation from it.
+	previousCancel := p.retryCancel
+	p.retryContext, p.retryCancel = context.WithDeadlineCause(ctx, deadline, cause)
+	if previousCancel != nil {
+		cancel := p.retryCancel
+		p.retryCancel = func() {
+			cancel()
+			previousCancel()
+		}
+	}
+}
+
+func (p *Poller) clearErrorWindow() {
+	if p.retryCancel != nil {
+		p.retryCancel()
+	}
+	p.retryContext = nil
+	p.retryCancel = nil
 }
 
 func (p *Poller) contextError(ctx context.Context) error {
