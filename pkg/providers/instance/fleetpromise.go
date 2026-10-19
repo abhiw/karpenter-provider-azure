@@ -19,6 +19,7 @@ package instance
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/samber/lo"
@@ -34,13 +35,16 @@ import (
 
 // FleetMemberPromise implements the Promise interface for Fleet-provisioned VMs.
 // Unlike VirtualMachinePromise, VM identity is unknown at construction time —
-// fields are populated lazily inside Wait() after the batch completes.
+// fields are populated by ResolveAssignment() after the batch completes.
 type FleetMemberPromise struct {
 	sharedState   *fleet.FleetSharedState
 	nodeClaimName string
 	capacityType  string
 	fleetName     string
 	vmProvider    VMProvider
+	tags          map[string]*string
+	waitOnce      sync.Once
+	waitErr       error
 
 	// Fields for GET-based provisioning state polling and error handling.
 	// These are plumbed from DefaultFleetProvider.BeginCreate() at construction.
@@ -51,7 +55,7 @@ type FleetMemberPromise struct {
 	instanceTypeProvider instancetype.Provider
 	pollerOptions        *fleetvmpoller.Options // nil means use DefaultOptions()
 
-	// Populated after Wait() completes successfully
+	// Populated synchronously by ResolveAssignment(), before Wait() starts.
 	VM           *armcompute.VirtualMachine
 	InstanceType *cloudprovider.InstanceType
 	Zone         string
@@ -105,27 +109,33 @@ func (p *FleetMemberPromise) ResolveAssignment() error {
 // unavailable in the cache (same pattern as SI VM's WaitFunc closure) and returns
 // an error so the background goroutine triggers cleanup + NodeClaim deletion.
 //
-// On success, Wait updates .VM with the full VM object from the compute GET
-// (which includes Tags, TimeCreated, ImageReference, etc.) — though the NodeClaim
-// was already created from the stub VM by ResolveAssignment, these fields are
-// informational and not required for correctness.
+// Billing is installed after VM provisioning. The assignment remains immutable
+// because CloudProvider.Create reads it concurrently to construct the NodeClaim.
 func (p *FleetMemberPromise) Wait() error {
+	p.waitOnce.Do(func() {
+		p.waitErr = p.wait()
+	})
+	return p.waitErr
+}
+
+func (p *FleetMemberPromise) wait() error {
+	if p.VM == nil {
+		return fmt.Errorf("fleet promise for NodeClaim %s has no assigned VM", p.nodeClaimName)
+	}
 	vmName := lo.FromPtr(p.VM.Name)
 	if vmName == "" {
 		return fmt.Errorf("fleet promise for NodeClaim %s has no VM name (call ResolveAssignment first)", p.nodeClaimName)
 	}
 
-	// // Poll compute GET until provisioningState reaches Succeeded or Failed.
-	// vm, pollErr := p.pollVMProvisioning(vmName)
-	// if pollErr != nil {
-	// 	p.handleFailedProvisioning(pollErr)
-	// 	return pollErr
-	// }
-
-	// Provisioning succeeded — update .VM with the full object.
-	// p.VM = vm
-	if p.VM != nil && p.VM.ID != nil {
-		p.ProviderID = utils.VMResourceIDToProviderID(p.ctx, *p.VM.ID)
+	if p.ctx == nil || p.vmClient == nil || p.vmProvider == nil {
+		return fmt.Errorf("fleet promise for VM %q requires context, VM client and VM provider", vmName)
+	}
+	if _, err := p.pollVMProvisioning(vmName); err != nil {
+		p.handleFailedProvisioning(err)
+		return err
+	}
+	if err := p.vmProvider.EnsureAKSIdentifyingExtension(p.ctx, vmName, p.tags); err != nil {
+		return fmt.Errorf("installing AKS identifying extension for fleet VM %q: %w", vmName, err)
 	}
 	return nil
 }
@@ -134,11 +144,6 @@ func (p *FleetMemberPromise) Wait() error {
 // Uses the same polling pattern as aksmachinepoller (5s interval, exponential backoff).
 func (p *FleetMemberPromise) pollVMProvisioning(vmName string) (*armcompute.VirtualMachine, error) {
 	if p.vmClient == nil || p.ctx == nil {
-		// Legacy/test path without polling dependencies - fall back to assignment VM as-is.
-		assignment := p.sharedState.GetAssignment(p.nodeClaimName)
-		if assignment != nil && assignment.VM != nil {
-			return assignment.VM, nil
-		}
 		return nil, fmt.Errorf("no VM client available to poll fleet VM %q", vmName)
 	}
 

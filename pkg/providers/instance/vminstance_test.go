@@ -17,6 +17,7 @@ limitations under the License.
 package instance
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -25,6 +26,15 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 )
+
+func TestEnsureAKSIdentifyingExtension_UnsupportedCloud(t *testing.T) {
+	g := NewWithT(t)
+	baseEnv := lo.Must(auth.EnvironmentFromName("AzurePublicCloud"))
+	innerEnv := *baseEnv.Environment
+	innerEnv.Name = "AzureStackCloud"
+	p := &DefaultVMProvider{env: &auth.Environment{Environment: &innerEnv, Cloud: baseEnv.Cloud}}
+	g.Expect(p.EnsureAKSIdentifyingExtension(context.Background(), "vm", nil)).To(Succeed())
+}
 
 func TestGetManagedExtensionNames(t *testing.T) {
 	publicCloudEnv := lo.Must(auth.EnvironmentFromName("AzurePublicCloud"))

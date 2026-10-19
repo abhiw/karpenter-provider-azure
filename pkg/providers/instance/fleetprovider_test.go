@@ -31,7 +31,25 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 )
+
+func TestBuildFleetExtensions_OnlyBootstrapExtensions(t *testing.T) {
+	for _, script := range []string{"", "echo bootstrap"} {
+		t.Run(fmt.Sprintf("hasCSE=%t", script != ""), func(t *testing.T) {
+			g := NewWithT(t)
+			exts := buildFleetExtensions(&launchtemplate.Template{CustomScriptsCSE: script}, "eastus2euap", nil)
+			if script == "" {
+				g.Expect(exts).To(BeEmpty())
+				return
+			}
+			g.Expect(exts).To(HaveLen(1))
+			g.Expect(lo.FromPtr(exts[0].Name)).To(Equal(cseNameLinux))
+			g.Expect(lo.FromPtr(exts[0].Properties.Type)).To(Equal("CustomScript"))
+			g.Expect(exts[0].Properties.ProtectedSettings).To(Equal(&map[string]interface{}{"commandToExecute": script}))
+		})
+	}
+}
 
 func TestFleetIPConfigurationCount(t *testing.T) {
 	for _, tc := range []struct {

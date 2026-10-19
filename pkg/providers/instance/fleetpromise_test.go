@@ -43,12 +43,25 @@ import (
 
 // promiseStubVMProvider records Delete calls and lets a test return errors.
 type promiseStubVMProvider struct {
-	mu        sync.Mutex
-	deleted   []string
-	returnErr error
+	mu            sync.Mutex
+	deleted       []string
+	returnErr     error
+	billed        []string
+	billingErr    error
+	beforeBilling func()
 }
 
 var _ VMProvider = (*promiseStubVMProvider)(nil)
+
+func (s *promiseStubVMProvider) EnsureAKSIdentifyingExtension(_ context.Context, name string, _ map[string]*string) error {
+	if s.beforeBilling != nil {
+		s.beforeBilling()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.billed = append(s.billed, name)
+	return s.billingErr
+}
 
 func (s *promiseStubVMProvider) Delete(_ context.Context, name string) error {
 	s.mu.Lock()
@@ -160,11 +173,11 @@ func TestFleetMemberPromise_Cleanup_LegacyFallback_NoVMClient(t *testing.T) {
 	g.Expect(p.Cleanup(context.Background())).To(Succeed())
 }
 
-// TestFleetMemberPromise_Wait_StampsProviderID exercises the real Wait() path
+// TestFleetMemberPromise_ResolveAssignment_StampsProviderID exercises assignment
 // against a pre-populated FleetSharedState and verifies p.ProviderID gets the
 // canonical NodeClaim shape (azure:// prefix, lowercase RG) so downstream
 // consumers can parse it with GetVMName.
-func TestFleetMemberPromise_Wait_StampsProviderID(t *testing.T) {
+func TestFleetMemberPromise_ResolveAssignment_StampsProviderID(t *testing.T) {
 	g := NewWithT(t)
 
 	vmSize := armcompute.VirtualMachineSizeTypes("Standard_D4s_v3")
@@ -205,7 +218,6 @@ func TestFleetMemberPromise_Wait_StampsProviderID(t *testing.T) {
 	}
 
 	g.Expect(p.ResolveAssignment()).To(Succeed())
-	g.Expect(p.Wait()).To(Succeed())
 	g.Expect(p.VM).NotTo(BeNil())
 	g.Expect(p.ProviderID).To(HavePrefix("azure://"))
 	g.Expect(strings.HasSuffix(p.ProviderID, "/vm-prov")).To(BeTrue())
@@ -422,6 +434,7 @@ func buildPromiseWithPolling(
 		errorHandling:        errorHandler,
 		instanceTypeProvider: itProvider,
 		pollerOptions:        &fastOpts,
+		vmProvider:           &promiseStubVMProvider{},
 	}
 	// ResolveAssignment must be called before Wait() to populate .VM/.InstanceType/.Zone.
 	if err := p.ResolveAssignment(); err != nil {
@@ -433,7 +446,6 @@ func buildPromiseWithPolling(
 // TestFleetMemberPromise_Wait_PollingImmediateSuccess verifies Wait() succeeds
 // when the first GET returns provisioningState=Succeeded.
 func TestFleetMemberPromise_Wait_PollingImmediateSuccess(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -445,7 +457,8 @@ func TestFleetMemberPromise_Wait_PollingImmediateSuccess(t *testing.T) {
 	p := buildPromiseWithPolling(t, "nc-poll-1", vmGetter, nil, nil)
 	g.Expect(p.Wait()).To(Succeed())
 	g.Expect(p.VM).NotTo(BeNil())
-	g.Expect(lo.FromPtr(p.VM.Properties.ProvisioningState)).To(Equal("Succeeded"))
+	g.Expect(p.VM.Properties.ProvisioningState).To(BeNil())
+	g.Expect(p.vmProvider.(*promiseStubVMProvider).billed).To(Equal([]string{"fleet-vm-poll"}))
 	g.Expect(p.ProviderID).To(HavePrefix("azure://"))
 	g.Expect(p.ProviderID).To(ContainSubstring("/resourceGroups/mc_rg/"))
 	g.Expect(vmGetter.CallCount()).To(BeNumerically(">=", 1))
@@ -454,7 +467,6 @@ func TestFleetMemberPromise_Wait_PollingImmediateSuccess(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingCreatingThenSucceeded verifies Wait() polls
 // through Creating state until Succeeded.
 func TestFleetMemberPromise_Wait_PollingCreatingThenSucceeded(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -468,14 +480,13 @@ func TestFleetMemberPromise_Wait_PollingCreatingThenSucceeded(t *testing.T) {
 	p := buildPromiseWithPolling(t, "nc-poll-2", vmGetter, nil, nil)
 	g.Expect(p.Wait()).To(Succeed())
 	g.Expect(p.VM).NotTo(BeNil())
-	g.Expect(lo.FromPtr(p.VM.Properties.ProvisioningState)).To(Equal("Succeeded"))
+	g.Expect(p.VM.Properties.ProvisioningState).To(BeNil())
 	g.Expect(vmGetter.CallCount()).To(Equal(3))
 }
 
 // TestFleetMemberPromise_Wait_PollingFailed verifies Wait() returns an error
 // when provisioningState reaches Failed.
 func TestFleetMemberPromise_Wait_PollingFailed(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -489,6 +500,7 @@ func TestFleetMemberPromise_Wait_PollingFailed(t *testing.T) {
 	err := p.Wait()
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("provisioning failed"))
+	g.Expect(p.vmProvider.(*promiseStubVMProvider).billed).To(BeEmpty())
 	// VM remains set from ResolveAssignment (the stub VM used to build the NodeClaim).
 	// On failure, the goroutine in handleInstancePromise handles cleanup.
 	g.Expect(p.VM).NotTo(BeNil())
@@ -500,7 +512,6 @@ func TestFleetMemberPromise_Wait_PollingFailed(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingFailedInvokesErrorHandler verifies that when
 // provisioning fails, the error handler is invoked (same as SI VM WaitFunc closure).
 func TestFleetMemberPromise_Wait_PollingFailedInvokesErrorHandler(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -526,7 +537,6 @@ func TestFleetMemberPromise_Wait_PollingFailedInvokesErrorHandler(t *testing.T) 
 // TestFleetMemberPromise_Wait_PollingFailedNilErrorHandler verifies Wait() still
 // returns error even when errorHandling is nil (graceful degradation).
 func TestFleetMemberPromise_Wait_PollingFailedNilErrorHandler(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -544,7 +554,6 @@ func TestFleetMemberPromise_Wait_PollingFailedNilErrorHandler(t *testing.T) {
 // TestFleetMemberPromise_Wait_PollingTransientErrorThenSuccess verifies retries
 // on transient GET errors.
 func TestFleetMemberPromise_Wait_PollingTransientErrorThenSuccess(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	transientErr := &azcore.ResponseError{
@@ -566,10 +575,8 @@ func TestFleetMemberPromise_Wait_PollingTransientErrorThenSuccess(t *testing.T) 
 	g.Expect(vmGetter.CallCount()).To(Equal(3))
 }
 
-// TestFleetMemberPromise_Wait_PollingNonTransientErrorFails verifies 404 etc.
-// cause immediate failure.
+// A 404 after observing the VM is terminal.
 func TestFleetMemberPromise_Wait_PollingNonTransientErrorFails(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	notFoundErr := &azcore.ResponseError{
@@ -579,6 +586,7 @@ func TestFleetMemberPromise_Wait_PollingNonTransientErrorFails(t *testing.T) {
 
 	vmGetter := &mockVMGetterForPromise{
 		responses: []mockVMGetResponse{
+			{vm: makeCreatingVM("fleet-vm-poll")},
 			{err: notFoundErr},
 		},
 	}
@@ -593,7 +601,6 @@ func TestFleetMemberPromise_Wait_PollingNonTransientErrorFails(t *testing.T) {
 
 // TestFleetMemberPromise_Wait_PollingContextCancelled verifies ctx cancellation.
 func TestFleetMemberPromise_Wait_PollingContextCancelled(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -646,6 +653,7 @@ func TestFleetMemberPromise_Wait_PollingContextCancelled(t *testing.T) {
 		vmClient:      vmGetter,
 		resourceGroup: "MC_rg",
 		pollerOptions: &fastOpts,
+		vmProvider:    &promiseStubVMProvider{},
 	}
 
 	// ResolveAssignment uses a non-cancelled context (shared state is in-memory),
@@ -734,9 +742,8 @@ func TestFleetMemberPromise_ResolveAssignment_VMWithEmptyName(t *testing.T) {
 	g.Expect(err.Error()).To(ContainSubstring("no VM name"))
 }
 
-// TestFleetMemberPromise_Wait_LegacyPathNoVMClient verifies the fallback behavior
-// when vmClient is nil (legacy tests) - uses assignment VM directly.
-func TestFleetMemberPromise_Wait_LegacyPathNoVMClient(t *testing.T) {
+// Missing polling dependencies must not produce a successful wait.
+func TestFleetMemberPromise_Wait_NoVMClientFails(t *testing.T) {
 	g := NewWithT(t)
 
 	vmSize := armcompute.VirtualMachineSizeTypes("Standard_D4s_v3")
@@ -778,16 +785,14 @@ func TestFleetMemberPromise_Wait_LegacyPathNoVMClient(t *testing.T) {
 	}
 
 	g.Expect(p.ResolveAssignment()).To(Succeed())
-	g.Expect(p.Wait()).To(Succeed())
+	g.Expect(p.Wait()).To(MatchError(ContainSubstring("requires context, VM client and VM provider")))
 	g.Expect(p.VM).NotTo(BeNil())
 	g.Expect(lo.FromPtr(p.VM.Name)).To(Equal("vm-legacy"))
 	g.Expect(p.ProviderID).To(HavePrefix("azure://"))
 }
 
-// TestFleetMemberPromise_Wait_PollingSuccessPopulatesProviderID verifies the
-// ProviderID is populated from the polled VM (not the assignment VM).
-func TestFleetMemberPromise_Wait_PollingSuccessPopulatesProviderID(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
+// Polling must not mutate the assignment read concurrently by CloudProvider.Create.
+func TestFleetMemberPromise_Wait_PollingPreservesProviderID(t *testing.T) {
 	g := NewWithT(t)
 
 	succeededVM := &armcompute.VirtualMachine{
@@ -814,8 +819,7 @@ func TestFleetMemberPromise_Wait_PollingSuccessPopulatesProviderID(t *testing.T)
 
 	p := buildPromiseWithPolling(t, "nc-providerid", vmGetter, nil, nil)
 	g.Expect(p.Wait()).To(Succeed())
-	// ProviderID should lowercase the RG
-	g.Expect(p.ProviderID).To(ContainSubstring("/resourceGroups/mc_rg_upper/"))
+	g.Expect(p.ProviderID).To(ContainSubstring("/resourceGroups/mc_rg/"))
 	g.Expect(p.ProviderID).To(HavePrefix("azure://"))
 }
 
@@ -823,7 +827,6 @@ func TestFleetMemberPromise_Wait_PollingSuccessPopulatesProviderID(t *testing.T)
 // verifies that when instanceTypeProvider.Get() fails, handleFailedProvisioning
 // logs the error gracefully and does not panic.
 func TestFleetMemberPromise_Wait_HandleFailedProvisioningGracefulWhenSKULookupFails(t *testing.T) {
-	t.Skip("Fleet VM polling temporarily disabled")
 	g := NewWithT(t)
 
 	vmGetter := &mockVMGetterForPromise{
@@ -843,4 +846,73 @@ func TestFleetMemberPromise_Wait_HandleFailedProvisioningGracefulWhenSKULookupFa
 	// Wait should still return the provisioning error (not the SKU lookup error)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("provisioning failed"))
+}
+
+func TestFleetMemberPromise_Wait_BillingAfterProvisioningOnce(t *testing.T) {
+	g := NewWithT(t)
+	getter := &mockVMGetterForPromise{responses: []mockVMGetResponse{
+		{vm: makeCreatingVM("fleet-vm-poll")},
+		{vm: makeSucceededVM("fleet-vm-poll")},
+	}}
+	p := buildPromiseWithPolling(t, "nc-billing", getter, nil, nil)
+	assignedVM := p.VM
+	providerID := p.ProviderID
+	stub := p.vmProvider.(*promiseStubVMProvider)
+	stub.beforeBilling = func() {
+		if getter.CallCount() != 2 {
+			t.Error("billing started before VM provisioning succeeded")
+		}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.Wait(); err != nil {
+				t.Errorf("Wait() failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	g.Expect(stub.billed).To(Equal([]string{"fleet-vm-poll"}))
+	g.Expect(getter.CallCount()).To(Equal(2))
+	g.Expect(p.VM).To(BeIdenticalTo(assignedVM))
+	g.Expect(p.ProviderID).To(Equal(providerID))
+}
+
+func TestFleetMemberPromise_Wait_BillingFailureIsRetained(t *testing.T) {
+	g := NewWithT(t)
+	getter := &mockVMGetterForPromise{responses: []mockVMGetResponse{{vm: makeSucceededVM("fleet-vm-poll")}}}
+	p := buildPromiseWithPolling(t, "nc-billing-error", getter, nil, nil)
+	billingErr := errors.New("extension provisioning failed")
+	stub := p.vmProvider.(*promiseStubVMProvider)
+	stub.billingErr = billingErr
+	err := p.Wait()
+	g.Expect(errors.Is(err, billingErr)).To(BeTrue())
+	g.Expect(err.Error()).To(ContainSubstring("installing AKS identifying extension"))
+	g.Expect(p.Wait()).To(BeIdenticalTo(err))
+	g.Expect(stub.billed).To(HaveLen(1))
+	g.Expect(getter.CallCount()).To(Equal(1))
+}
+
+func TestFleetMemberPromise_Wait_MissingDependencies(t *testing.T) {
+	for _, missing := range []string{"context", "client", "provider", "vm"} {
+		t.Run(missing, func(t *testing.T) {
+			g := NewWithT(t)
+			getter := &mockVMGetterForPromise{responses: []mockVMGetResponse{{vm: makeSucceededVM("fleet-vm-poll")}}}
+			p := buildPromiseWithPolling(t, "nc-missing", getter, nil, nil)
+			switch missing {
+			case "context":
+				p.ctx = nil
+			case "client":
+				p.vmClient = nil
+			case "provider":
+				p.vmProvider = nil
+			case "vm":
+				p.VM = nil
+			}
+			g.Expect(p.Wait()).To(HaveOccurred())
+			g.Expect(getter.CallCount()).To(BeZero())
+		})
+	}
 }

@@ -149,6 +149,7 @@ func (p *VirtualMachinePromise) GetInstanceName() string {
 }
 
 type VMProvider interface {
+	EnsureAKSIdentifyingExtension(context.Context, string, map[string]*string) error
 	BeginCreate(context.Context, *v1beta1.AKSNodeClass, *karpv1.NodeClaim, []*corecloudprovider.InstanceType) (*VirtualMachinePromise, error)
 	Get(context.Context, string) (*armcompute.VirtualMachine, error)
 	List(context.Context) ([]*armcompute.VirtualMachine, error)
@@ -179,8 +180,8 @@ type DefaultVMProvider struct {
 	env                          *auth.Environment
 
 	vmListQuery, nicListQuery, fleetVMListQuery string
-	deletingVMs                                  sets.Set[string] // tracks in-flight delete operations by VM name
-	deletingVMsMu                                sync.RWMutex
+	deletingVMs                                 sets.Set[string] // tracks in-flight delete operations by VM name
+	deletingVMsMu                               sync.RWMutex
 }
 
 func NewDefaultVMProvider(
@@ -435,6 +436,14 @@ func (p *DefaultVMProvider) ListNics(ctx context.Context) ([]*armnetwork.Interfa
 
 func (p *DefaultVMProvider) DeleteNic(ctx context.Context, nicName string) error {
 	return deleteNicIfExists(ctx, p.azClient.NetworkInterfacesClient(), p.resourceGroup, nicName)
+}
+
+// EnsureAKSIdentifyingExtension installs the identifying extension in supported clouds.
+func (p *DefaultVMProvider) EnsureAKSIdentifyingExtension(ctx context.Context, vmName string, tags map[string]*string) error {
+	if !isAKSIdentifyingExtensionEnabled(p.env) {
+		return nil
+	}
+	return p.createAKSIdentifyingExtension(ctx, vmName, tags)
 }
 
 // createAKSIdentifyingExtension attaches a VM extension to identify that this VM participates in an AKS cluster
@@ -909,11 +918,8 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 					return err
 				}
 			}
-			if isAKSIdentifyingExtensionEnabled(p.env) {
-				err = p.createAKSIdentifyingExtension(ctx, resourceName, launchTemplate.Tags)
-				if err != nil {
-					return err
-				}
+			if err = p.EnsureAKSIdentifyingExtension(ctx, resourceName, launchTemplate.Tags); err != nil {
+				return err
 			}
 
 			return nil

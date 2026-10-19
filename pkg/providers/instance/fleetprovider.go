@@ -180,7 +180,7 @@ func (p *DefaultFleetProvider) BeginCreate(
 	nsgID := p.resolveNSG(ctx, launchTemplate.SubnetID)
 
 	// 8. Build FleetVMProvisionRequest.
-	// 8b. Build extensions for fleet body (CSE + billing).
+	// Billing is installed per assigned VM after provisioning succeeds.
 	extensions := buildFleetExtensions(launchTemplate, p.location, launchTemplate.Tags)
 
 	req := fleet.FleetVMProvisionRequest{
@@ -228,6 +228,7 @@ func (p *DefaultFleetProvider) BeginCreate(
 		capacityType:         capacityType,
 		fleetName:            fleetName,
 		vmProvider:           p.vmProvider,
+		tags:                 launchTemplate.Tags,
 		ctx:                  ctx,
 		vmClient:             p.vmClient,
 		resourceGroup:        p.resourceGroup,
@@ -282,9 +283,8 @@ func extractCandidateInfo(candidates []allocationstrategy.InstanceOffering) (
 	return
 }
 
-// buildFleetExtensions builds the CSE and billing extensions for a Fleet VM request.
-// Mirrors the logic in DefaultVMProvider.getCSExtension / getAKSIdentifyingExtension
-// but returns them as a slice for embedding in the Fleet body's extension profile.
+// buildFleetExtensions builds bootstrap extensions for the initial Fleet request.
+// Mirrors DefaultVMProvider.getCSExtension for the Fleet body's extension profile.
 func buildFleetExtensions(lt *launchtemplate.Template, location string, tags map[string]*string) []*armcompute.VirtualMachineExtension {
 	var exts []*armcompute.VirtualMachineExtension
 
@@ -293,10 +293,6 @@ func buildFleetExtensions(lt *launchtemplate.Template, location string, tags map
 		cse := buildCSExtensionForFleet(lt.CustomScriptsCSE, lt.IsWindows, location, tags)
 		exts = append(exts, cse)
 	}
-
-	// 2. AKS Billing/Identifying extension — always added for Linux.
-	// (In production, gated by isAKSIdentifyingExtensionEnabled; for POC, always add.)
-	exts = append(exts, buildBillingExtensionForFleet(location, tags))
 
 	return exts
 }
@@ -322,21 +318,6 @@ func buildCSExtensionForFleet(cse string, isWindows bool, location string, tags 
 			ProtectedSettings: &map[string]interface{}{
 				"commandToExecute": cse,
 			},
-		},
-		Tags: tags,
-	}
-}
-
-func buildBillingExtensionForFleet(location string, tags map[string]*string) *armcompute.VirtualMachineExtension {
-	return &armcompute.VirtualMachineExtension{
-		Location: lo.ToPtr(location),
-		Name:     lo.ToPtr(aksIdentifyingExtensionName),
-		Properties: &armcompute.VirtualMachineExtensionProperties{
-			Publisher:               lo.ToPtr("Microsoft.AKS"),
-			TypeHandlerVersion:      lo.ToPtr("1.0"),
-			AutoUpgradeMinorVersion: lo.ToPtr(true),
-			Settings:                &map[string]interface{}{},
-			Type:                    lo.ToPtr("Compute.AKS.Linux.Billing"),
 		},
 		Tags: tags,
 	}

@@ -51,11 +51,13 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	"github.com/Azure/karpenter-provider-azure/pkg/cloudprovider"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	metrics "github.com/Azure/karpenter-provider-azure/pkg/metrics"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient"
 	instancemetrics "github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
@@ -136,6 +138,43 @@ func TestErrorCodeForMetrics(t *testing.T) {
 			if got != tc.want {
 				t.Fatalf("ErrorCodeForMetrics(%v) = %q, want %q", tc.err, got, tc.want)
 			}
+		})
+	}
+}
+
+func TestEnsureAKSIdentifyingExtension_CreateAndErrors(t *testing.T) {
+	for _, failure := range []string{"", "begin", "poll"} {
+		t.Run("failure="+failure, func(t *testing.T) {
+			g := NewWithT(t)
+			extensions := &fake.VirtualMachineExtensionsAPI{}
+			extensions.Reset()
+			expectedErr := errors.New("billing installation failed")
+			if failure == "begin" {
+				extensions.VirtualMachineExtensionsCreateOrUpdateBehavior.BeginError.Set(expectedErr)
+			}
+			if failure == "poll" {
+				extensions.VirtualMachineExtensionsCreateOrUpdateBehavior.Error.Set(expectedErr)
+			}
+			client := azclient.NewAZClientFromAPI(nil, nil, nil, nil, nil, extensions, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+			provider := instancemetrics.NewDefaultVMProvider(client, nil, nil, nil, nil, nil, nil,
+				"eastus2euap", "node-rg", "subscription", consts.ProvisionModeAKSScriptless, "",
+				lo.Must(auth.EnvironmentFromName("AzurePublicCloud")))
+			tags := map[string]*string{"existing": lo.ToPtr("value")}
+			err := provider.EnsureAKSIdentifyingExtension(context.Background(), "assigned-vm", tags)
+			if failure == "" {
+				g.Expect(err).NotTo(HaveOccurred())
+			} else {
+				g.Expect(errors.Is(err, expectedErr)).To(BeTrue())
+			}
+			calls := extensions.VirtualMachineExtensionsCreateOrUpdateBehavior.CalledWithInput
+			g.Expect(calls.Len()).To(Equal(1))
+			input := calls.Pop()
+			g.Expect(input.ResourceGroupName).To(Equal("node-rg"))
+			g.Expect(input.VirtualMachineName).To(Equal("assigned-vm"))
+			g.Expect(input.VirtualMachineExtensionName).To(Equal("computeAksLinuxBilling"))
+			g.Expect(lo.FromPtr(input.VirtualMachineExtension.Properties.Publisher)).To(Equal("Microsoft.AKS"))
+			g.Expect(lo.FromPtr(input.VirtualMachineExtension.Properties.Type)).To(Equal("Compute.AKS.Linux.Billing"))
+			g.Expect(input.VirtualMachineExtension.Tags).To(Equal(tags))
 		})
 	}
 }
