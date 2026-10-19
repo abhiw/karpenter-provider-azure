@@ -212,6 +212,29 @@ func collectResponses(batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchRe
 
 // --- Tests ---
 
+func TestExecutor_TagsDoNotAddAKSOwnership(t *testing.T) {
+	g := NewWithT(t)
+	fleetAPI := &mockFleetAPI{}
+	exec := newExecutor(fleetAPI, &mockVMAPIForExecutor{}, nil, "test", "rg", "eastus")
+	batch := makeBatch("default/on-demand/abcdef0123456789", "nc-1")
+	tags := map[string]*string{
+		launchtemplate.KarpenterManagedTagKey: lo.ToPtr("test"),
+		launchtemplate.BillingTagKey:          lo.ToPtr(launchtemplate.BillingTagValueLinux),
+		"custom":                              lo.ToPtr("value"),
+	}
+	batch.Requests[0].Payload.Tags = tags
+	exec.executeBatch(context.Background(), batch)
+	g.Expect(collectResponses(batch)).To(HaveLen(1))
+	g.Expect(fleetAPI.createdBodies).To(HaveLen(1))
+	body := fleetAPI.createdBodies[0]
+	g.Expect(body.Tags).NotTo(HaveKey("karpenter.azure.com_managed-by"))
+	g.Expect(body.Tags).To(HaveKeyWithValue(FleetNameTagKey, lo.ToPtr(fleetAPI.createdFleets[0])))
+	for key, value := range tags {
+		g.Expect(body.Tags).To(HaveKeyWithValue(key, value))
+	}
+	g.Expect(tags).NotTo(HaveKey(FleetNameTagKey))
+}
+
 func TestExecutor_IPConfigurationCount(t *testing.T) {
 	for _, count := range []int32{1, 30, 0} {
 		t.Run(fmt.Sprint(count), func(t *testing.T) {

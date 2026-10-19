@@ -441,6 +441,10 @@ func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
 		nodeClaims = append(nodeClaims, nodeClaim)
 	}
 
+	if !options.FromContext(ctx).IsFleetMode() {
+		return nodeClaims, nil
+	}
+
 	// List Fleet-provisioned VMs separately so the upstream nodeclaim GC controller
 	// can see them and won't delete their NodeClaims thinking the instance is gone.
 	fleetVMInstances, err := c.vmInstanceProvider.ListFleetVMs(ctx)

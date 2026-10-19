@@ -40,10 +40,6 @@ const (
 	// FleetNameTagKey is applied to all Fleet VMs so the executor can discover them after LRO.
 	FleetNameTagKey = "karpenter.azure.com_fleet-name"
 
-	// ManagedByTagKey identifies the fleet resource as managed by AKS.
-	ManagedByTagKey   = "karpenter.azure.com_managed-by"
-	ManagedByTagValue = "aks"
-
 	// MaxFleetCapacity is the maximum number of VMs per single Fleet resource.
 	// Azure Fleet API supports up to 10,000 VMs per fleet, but we use a conservative
 	// limit to avoid excessively large ARM operations. This is hardcoded because it
@@ -216,7 +212,6 @@ func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch
 		fleetTags[k] = v
 	}
 	fleetTags[FleetNameTagKey] = lo.ToPtr(name)
-	fleetTags[ManagedByTagKey] = lo.ToPtr(ManagedByTagValue)
 
 	fleetBody, err := BuildFleetBody(
 		fields,

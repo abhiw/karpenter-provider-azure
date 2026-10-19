@@ -35,13 +35,13 @@ import (
 // BuildFleetBody constructs the armcomputefleet.Fleet resource body for a BeginCreateOrUpdate call.
 //
 // The caller (executor) is responsible for:
-//   - Populating `tags` with the batch-key markers (karpenter.azure.com_managed-by, karpenter.azure.com_batch-key-hash)
+//   - Populating `tags` with launch-template tags and the Fleet discovery marker (karpenter.azure.com_fleet-name)
 //   - Passing the fleet name separately in the URL path (Fleet.Name is read-only and never set here)
 //
 // Parameters:
 //   - fields: the BatchKeyFields that define this batch (all requests in the batch share identical fields)
 //   - targetCapacity: number of VMs to request from Fleet
-//   - tags: pre-merged tag map including batch markers
+//   - tags: pre-merged tag map including the Fleet discovery marker
 //   - spotMaxPrice: max price per VM for spot; nil means default (-1 = up to on-demand price)
 //   - location: Azure region
 //   - lbBackendPools: load balancer backend address pool resource IDs
