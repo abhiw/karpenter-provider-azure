@@ -30,21 +30,22 @@ import (
 // Requests with identical BatchKeyFields land in the same Fleet.
 // Used by BuildFleetBody to construct the Fleet PUT body.
 type BatchKeyFields struct {
-	NodePoolName        string
-	CapacityType        string
-	ImageID             string
-	SubnetID            string
-	SSHPublicKey        string
-	AdminUsername       string
-	CustomData          string
-	OSDiskSizeGB        int
-	OSDiskType          string
-	EncryptionAtHost    bool
-	DiskEncryptionSetID string
-	NodeIdentities      string   // sorted, comma-joined
-	NSG                 string
-	CandidateSKUs       []string // sorted alphabetically before hashing
-	Zones               []string // sorted alphabetically before hashing
+	NodePoolName         string
+	CapacityType         string
+	ImageID              string
+	SubnetID             string
+	IPConfigurationCount int32
+	SSHPublicKey         string
+	AdminUsername        string
+	CustomData           string
+	OSDiskSizeGB         int
+	OSDiskType           string
+	EncryptionAtHost     bool
+	DiskEncryptionSetID  string
+	NodeIdentities       string // sorted, comma-joined
+	NSG                  string
+	CandidateSKUs        []string // sorted alphabetically before hashing
+	Zones                []string // sorted alphabetically before hashing
 
 	// Interconnect topology fields (see FleetVMProvisionRequest). Requests targeting
 	// different interconnect placement MUST NOT share a Fleet, since a Fleet's
@@ -74,7 +75,7 @@ func DetermineBatchKey(req *FleetVMProvisionRequest) (string, error) {
 	// Build the Fleet body with capacity=1. This is the canonical representation
 	// of a single-VM Fleet request. Requests that produce the same body at capacity=1
 	// are compatible and can share a Fleet at capacity=N.
-	fleetBody := BuildFleetBody(
+	fleetBody, err := BuildFleetBody(
 		fields,
 		1, // capacity=1: constant across all requests
 		req.Tags,
@@ -85,6 +86,9 @@ func DetermineBatchKey(req *FleetVMProvisionRequest) (string, error) {
 		false, // useSIG
 		req.Extensions,
 	)
+	if err != nil {
+		return "", fmt.Errorf("building fleet body for batch key: %w", err)
+	}
 
 	// The Fleet body does not include interconnect fields (they are injected via a
 	// raw JSON patch on the request context, not expressed in the typed SDK struct).
@@ -120,15 +124,16 @@ func DetermineBatchKey(req *FleetVMProvisionRequest) (string, error) {
 // Used by DetermineBatchKey and by the executor (via extractBatchKeyFields).
 func extractBatchKeyFieldsFromRequest(req *FleetVMProvisionRequest) BatchKeyFields {
 	return BatchKeyFields{
-		NodePoolName:  req.NodeClaim.Labels[karpv1.NodePoolLabelKey],
-		CapacityType:  req.CapacityType,
-		ImageID:       req.LaunchTemplate.ImageID,
-		SubnetID:      req.LaunchTemplate.SubnetID,
-		SSHPublicKey:  req.SSHPublicKey,
-		AdminUsername: req.AdminUsername,
-		CustomData:    req.LaunchTemplate.ScriptlessCustomData,
-		OSDiskSizeGB:  int(req.LaunchTemplate.StorageProfileSizeGB),
-		OSDiskType:    string(req.LaunchTemplate.StorageProfilePlacement),
+		NodePoolName:         req.NodeClaim.Labels[karpv1.NodePoolLabelKey],
+		CapacityType:         req.CapacityType,
+		ImageID:              req.LaunchTemplate.ImageID,
+		SubnetID:             req.LaunchTemplate.SubnetID,
+		IPConfigurationCount: req.IPConfigurationCount,
+		SSHPublicKey:         req.SSHPublicKey,
+		AdminUsername:        req.AdminUsername,
+		CustomData:           req.LaunchTemplate.ScriptlessCustomData,
+		OSDiskSizeGB:         int(req.LaunchTemplate.StorageProfileSizeGB),
+		OSDiskType:           string(req.LaunchTemplate.StorageProfilePlacement),
 
 		EncryptionAtHost:    req.NodeClass.GetEncryptionAtHost(),
 		DiskEncryptionSetID: req.DiskEncryptionSetID,

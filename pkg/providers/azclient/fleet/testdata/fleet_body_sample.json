@@ -77,8 +77,7 @@
             "managedDisk": {
               "diskEncryptionSet": {
                 "id": "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/diskEncryptionSets/des"
-              },
-              "storageAccountType": "Standard_LRS"
+              }
             },
             "osType": "Linux"
           }

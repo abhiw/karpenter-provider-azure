@@ -22,8 +22,8 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/onsi/gomega"
-	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
@@ -33,17 +33,18 @@ import (
 func mkReq(mods ...func(*FleetVMProvisionRequest)) *FleetVMProvisionRequest {
 	encrypt := false
 	req := &FleetVMProvisionRequest{
-		NodeClaimName:       "nc-default",
-		CapacityType:        karpv1.CapacityTypeOnDemand,
-		AcceptableSKUs:      []string{"Standard_D2s_v3", "Standard_D4s_v3"},
-		AcceptableZones:     []string{"1", "2"},
-		Tags:                map[string]*string{},
-		SSHPublicKey:        "ssh-rsa AAAA...",
-		AdminUsername:       "azureuser",
-		NodeIdentities:      []string{"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uai1"},
-		DiskEncryptionSetID: "",
-		NSG:                 "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg",
-		Location:            "eastus",
+		NodeClaimName:        "nc-default",
+		IPConfigurationCount: 1,
+		CapacityType:         karpv1.CapacityTypeOnDemand,
+		AcceptableSKUs:       []string{"Standard_D2s_v3", "Standard_D4s_v3"},
+		AcceptableZones:      []string{"1", "2"},
+		Tags:                 map[string]*string{},
+		SSHPublicKey:         "ssh-rsa AAAA...",
+		AdminUsername:        "azureuser",
+		NodeIdentities:       []string{"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uai1"},
+		DiskEncryptionSetID:  "",
+		NSG:                  "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg",
+		Location:             "eastus",
 		NodeClaim: &karpv1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: "nc-default",
@@ -76,6 +77,19 @@ func mkReq(mods ...func(*FleetVMProvisionRequest)) *FleetVMProvisionRequest {
 
 func withTags(t map[string]*string) func(*FleetVMProvisionRequest) {
 	return func(r *FleetVMProvisionRequest) { r.Tags = t }
+}
+
+func TestDetermineBatchKey_IPConfigurationCount(t *testing.T) {
+	g := gomega.NewWithT(t)
+	single := mkReq()
+	multiple := mkReq(func(r *FleetVMProvisionRequest) { r.IPConfigurationCount = 30 })
+	g.Expect(mustKey(t, single)).NotTo(gomega.Equal(mustKey(t, multiple)))
+	g.Expect(mustKey(t, multiple)).To(gomega.Equal(mustKey(t, mkReq(func(r *FleetVMProvisionRequest) {
+		r.IPConfigurationCount = 30
+	}))))
+	g.Expect(extractBatchKeyFieldsFromRequest(multiple).IPConfigurationCount).To(gomega.Equal(int32(30)))
+	_, err := DetermineBatchKey(mkReq(func(r *FleetVMProvisionRequest) { r.IPConfigurationCount = 0 }))
+	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("IP configuration count")))
 }
 func withNodeClaimName(n string) func(*FleetVMProvisionRequest) {
 	return func(r *FleetVMProvisionRequest) {
@@ -265,7 +279,8 @@ func TestDetermineBatchKey_UnsetInterconnectFieldsMatchEmptyDefault(t *testing.T
 // TestDetermineBatchKey_NilRequestReturnsError verifies the nil-safety contract:
 // a nil request must produce a non-nil error rather than panic or return an empty
 // key. The batcher wraps this error and surfaces it to the caller of Enqueue.
-func TestDetermineBatchKey_NilRequestReturnsError(t *testing.T) {	t.Parallel()
+func TestDetermineBatchKey_NilRequestReturnsError(t *testing.T) {
+	t.Parallel()
 	g := gomega.NewWithT(t)
 
 	_, err := DetermineBatchKey(nil)

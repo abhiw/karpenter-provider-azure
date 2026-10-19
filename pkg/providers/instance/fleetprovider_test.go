@@ -21,14 +21,39 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
 )
+
+func TestFleetIPConfigurationCount(t *testing.T) {
+	for _, tc := range []struct {
+		name, plugin, mode string
+		maxPods            *int32
+		expected           int32
+	}{
+		{"node subnet default", consts.NetworkPluginAzure, consts.NetworkPluginModeNone, nil, consts.DefaultNodeSubnetMaxPods},
+		{"node subnet explicit", consts.NetworkPluginAzure, consts.NetworkPluginModeNone, lo.ToPtr(int32(42)), 42},
+		{"overlay default", consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay, nil, 1},
+		{"overlay explicit", consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay, lo.ToPtr(int32(42)), 1},
+		{"kubenet", "kubenet", "", lo.ToPtr(int32(42)), 1},
+		{"none", consts.NetworkPluginNone, "", nil, 1},
+		{"invalid count reaches validation", consts.NetworkPluginAzure, "", lo.ToPtr(int32(0)), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{MaxPods: tc.maxPods}}
+			g.Expect(fleetIPConfigurationCount(nodeClass, tc.plugin, tc.mode)).To(Equal(tc.expected))
+		})
+	}
+}
 
 // --- Helper builders ---
 

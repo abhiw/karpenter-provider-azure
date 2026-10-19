@@ -18,6 +18,7 @@ package fleet
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -69,14 +70,16 @@ type mockFleetAPI struct {
 	createDelay   time.Duration
 	createErr     error
 	createdFleets []string
+	createdBodies []armcomputefleet.Fleet
 	onCreateName  func(name string)                 // optional callback with the fleet name on each PUT
 	listVMs       []*armcomputefleet.VirtualMachine // VMs returned by NewListVirtualMachinesPager, if set
 }
 
-func (m *mockFleetAPI) BeginCreateOrUpdate(_ context.Context, _ string, fleetName string, _ armcomputefleet.Fleet, _ *armcomputefleet.FleetsClientBeginCreateOrUpdateOptions) (*runtime.Poller[armcomputefleet.FleetsClientCreateOrUpdateResponse], error) {
+func (m *mockFleetAPI) BeginCreateOrUpdate(_ context.Context, _ string, fleetName string, body armcomputefleet.Fleet, _ *armcomputefleet.FleetsClientBeginCreateOrUpdateOptions) (*runtime.Poller[armcomputefleet.FleetsClientCreateOrUpdateResponse], error) {
 	m.mu.Lock()
 	m.createCalls++
 	m.createdFleets = append(m.createdFleets, fleetName)
+	m.createdBodies = append(m.createdBodies, body)
 	onCreateName := m.onCreateName
 	m.mu.Unlock()
 
@@ -174,13 +177,14 @@ func makeBatch(key string, nodeClaimNames ...string) *batcher.Batch[FleetVMProvi
 		req := &batcher.BatchedRequest[FleetVMProvisionRequest, FleetBatchResponse]{
 			Key: key,
 			Payload: FleetVMProvisionRequest{
-				NodeClaimName:   name,
-				CapacityType:    karpv1.CapacityTypeOnDemand,
-				AcceptableSKUs:  []string{"Standard_D2s_v3"},
-				AcceptableZones: []string{"1"},
-				InstanceTypes:   map[string]*cloudprovider.InstanceType{"Standard_D2s_v3": {Name: "Standard_D2s_v3"}},
-				NodeClaim:       &karpv1.NodeClaim{},
-				NodeClass:       &v1beta1.AKSNodeClass{},
+				IPConfigurationCount: 1,
+				NodeClaimName:        name,
+				CapacityType:         karpv1.CapacityTypeOnDemand,
+				AcceptableSKUs:       []string{"Standard_D2s_v3"},
+				AcceptableZones:      []string{"1"},
+				InstanceTypes:        map[string]*cloudprovider.InstanceType{"Standard_D2s_v3": {Name: "Standard_D2s_v3"}},
+				NodeClaim:            &karpv1.NodeClaim{},
+				NodeClass:            &v1beta1.AKSNodeClass{},
 				LaunchTemplate: &launchtemplate.Template{
 					ImageID:  "/sub/rg/image",
 					SubnetID: "/sub/rg/subnet",
@@ -207,6 +211,32 @@ func collectResponses(batch *batcher.Batch[FleetVMProvisionRequest, FleetBatchRe
 }
 
 // --- Tests ---
+
+func TestExecutor_IPConfigurationCount(t *testing.T) {
+	for _, count := range []int32{1, 30, 0} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			g := NewWithT(t)
+			fleetAPI := &mockFleetAPI{}
+			exec := &executor{
+				fleetClient: fleetAPI, vmClient: &mockVMAPIForExecutor{},
+				clusterName: "test", resourceGroup: "rg", location: "eastus", maxFleetCapacity: 200,
+			}
+			batch := makeBatch("default/on-demand/abcdef0123456789", "nc-1")
+			batch.Requests[0].Payload.IPConfigurationCount = count
+			exec.executeBatch(context.Background(), batch)
+			responses := collectResponses(batch)
+			g.Expect(responses).To(HaveLen(1))
+			if count == 0 {
+				g.Expect(fleetAPI.createCalls).To(BeZero())
+				g.Expect(responses[0].Error).To(MatchError(ContainSubstring("IP configuration count")))
+				return
+			}
+			g.Expect(fleetAPI.createdBodies).To(HaveLen(1))
+			configs := fleetAPI.createdBodies[0].Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations[0].Properties.IPConfigurations
+			g.Expect(configs).To(HaveLen(int(count)))
+		})
+	}
+}
 
 // TestExecutor_DifferentKeysRunInParallel verifies that batches
 // with different keys run independently in parallel.

@@ -18,6 +18,7 @@ package fleet
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -37,28 +38,29 @@ import (
 // defaultFields returns a BatchKeyFields with reasonable defaults for testing.
 func defaultFields() BatchKeyFields {
 	return BatchKeyFields{
-		NodePoolName:        "default",
-		CapacityType:        "on-demand",
-		ImageID:             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/i/versions/v",
-		SubnetID:            "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/sn",
-		SSHPublicKey:        "ssh-rsa AAAA...",
-		AdminUsername:       "azureuser",
-		CustomData:          "Y3VzdG9tZGF0YQ==",
-		OSDiskSizeGB:        128,
-		OSDiskType:          "",
-		EncryptionAtHost:    false,
-		DiskEncryptionSetID: "",
-		NodeIdentities:      "",
-		NSG:                 "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg",
-		CandidateSKUs:       []string{"Standard_D4s_v3", "Standard_D8s_v3"},
-		Zones:               []string{"1", "2", "3"},
+		NodePoolName:         "default",
+		IPConfigurationCount: 1,
+		CapacityType:         "on-demand",
+		ImageID:              "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/i/versions/v",
+		SubnetID:             "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/sn",
+		SSHPublicKey:         "ssh-rsa AAAA...",
+		AdminUsername:        "azureuser",
+		CustomData:           "Y3VzdG9tZGF0YQ==",
+		OSDiskSizeGB:         128,
+		OSDiskType:           "",
+		EncryptionAtHost:     false,
+		DiskEncryptionSetID:  "",
+		NodeIdentities:       "",
+		NSG:                  "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/networkSecurityGroups/nsg",
+		CandidateSKUs:        []string{"Standard_D4s_v3", "Standard_D8s_v3"},
+		Zones:                []string{"1", "2", "3"},
 	}
 }
 
 // defaultTags returns a minimal tag map including the karpenter markers.
 func defaultTags() map[string]*string {
 	return map[string]*string{
-		"karpenter.azure.com_managed-by":    lo.ToPtr("aks"),
+		"karpenter.azure.com_managed-by":     lo.ToPtr("aks"),
 		"karpenter.azure.com_batch-key-hash": lo.ToPtr("abcdef0123456789"),
 	}
 }
@@ -93,6 +95,44 @@ func mkInstanceTypesNoAN(skus ...string) map[string]*corecloudprovider.InstanceT
 
 // --- Tests ---
 
+func TestBuildFleetBody_IPConfigurations(t *testing.T) {
+	for _, count := range []int32{1, 2, 30, 250} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			fields := defaultFields()
+			fields.IPConfigurationCount = count
+			body, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", []string{"/lb/pool"}, nil, false, nil)
+			require.NoError(t, err)
+			data, err := json.Marshal(body)
+			require.NoError(t, err)
+			var decoded armcomputefleet.Fleet
+			require.NoError(t, json.Unmarshal(data, &decoded))
+			configs := decoded.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations[0].Properties.IPConfigurations
+			require.Len(t, configs, int(count))
+			for i, config := range configs {
+				assert.Equal(t, fmt.Sprintf("ipconfig%d", i+1), *config.Name)
+				assert.Equal(t, fields.SubnetID, *config.Properties.Subnet.ID)
+				assert.Equal(t, i == 0, *config.Properties.Primary)
+				if i == 0 {
+					require.Len(t, config.Properties.LoadBalancerBackendAddressPools, 1)
+					assert.Equal(t, "/lb/pool", *config.Properties.LoadBalancerBackendAddressPools[0].ID)
+				} else {
+					assert.Empty(t, config.Properties.LoadBalancerBackendAddressPools)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildFleetBody_InvalidIPConfigurationCount(t *testing.T) {
+	for _, count := range []int32{-1, 0, 251} {
+		fields := defaultFields()
+		fields.IPConfigurationCount = count
+		body, err := BuildFleetBody(fields, 1, nil, nil, "eastus", nil, nil, false, nil)
+		require.ErrorContains(t, err, "IP configuration count")
+		assert.Nil(t, body)
+	}
+}
+
 // TestBuildFleetBody_SpotCapacityType verifies that a spot capacity type produces only
 // a SpotPriorityProfile with PriceCapacityOptimized allocation, maintain=false, and
 // EvictionPolicy=Delete. The RegularPriorityProfile must be nil.
@@ -100,7 +140,9 @@ func TestBuildFleetBody_SpotCapacityType(t *testing.T) {
 	fields := defaultFields()
 	fields.CapacityType = "spot"
 
-	fleet := BuildFleetBody(fields, 5, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 5, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties)
 	require.NotNil(t, fleet.Properties.SpotPriorityProfile)
@@ -116,7 +158,9 @@ func TestBuildFleetBody_OnDemandCapacityType(t *testing.T) {
 	fields := defaultFields()
 	fields.CapacityType = "on-demand"
 
-	fleet := BuildFleetBody(fields, 3, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 3, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties)
 	require.NotNil(t, fleet.Properties.RegularPriorityProfile)
@@ -131,7 +175,9 @@ func TestBuildFleetBody_AlwaysLaunchMode(t *testing.T) {
 		fields := defaultFields()
 		fields.CapacityType = capacityType
 
-		fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+		fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+		require.NoError(t, err)
 
 		require.NotNil(t, fleet.Properties)
 		require.NotNil(t, fleet.Properties.Mode, "capacityType=%s", capacityType)
@@ -145,7 +191,9 @@ func TestBuildFleetBody_SpotMaxPriceDefault(t *testing.T) {
 	fields := defaultFields()
 	fields.CapacityType = "spot"
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties.SpotPriorityProfile)
 	require.NotNil(t, fleet.Properties.SpotPriorityProfile.MaxPricePerVM)
@@ -159,7 +207,9 @@ func TestBuildFleetBody_SpotMaxPriceExplicit(t *testing.T) {
 	fields.CapacityType = "spot"
 	price := float32(0.5)
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), &price, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), &price, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties.SpotPriorityProfile)
 	require.NotNil(t, fleet.Properties.SpotPriorityProfile.MaxPricePerVM)
@@ -172,7 +222,9 @@ func TestBuildFleetBody_VMSizesProfilePopulated(t *testing.T) {
 	fields := defaultFields()
 	fields.CandidateSKUs = []string{"Standard_D2s_v3", "Standard_D4s_v3", "Standard_D8s_v3"}
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D2s_v3", "Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D2s_v3", "Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties.VMSizesProfile)
 	assert.Len(t, fleet.Properties.VMSizesProfile, 3)
@@ -187,12 +239,14 @@ func TestBuildFleetBody_VMSizesProfilePopulated(t *testing.T) {
 func TestBuildFleetBody_TagsCarryThrough(t *testing.T) {
 	fields := defaultFields()
 	tags := map[string]*string{
-		"karpenter.azure.com_managed-by":    lo.ToPtr("aks"),
+		"karpenter.azure.com_managed-by":     lo.ToPtr("aks"),
 		"karpenter.azure.com_batch-key-hash": lo.ToPtr("deadbeef12345678"),
-		"env": lo.ToPtr("test"),
+		"env":                                lo.ToPtr("test"),
 	}
 
-	fleet := BuildFleetBody(fields, 1, tags, nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, tags, nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	assert.Equal(t, tags, fleet.Tags)
 }
@@ -203,7 +257,9 @@ func TestBuildFleetBody_EncryptionAtHostTrue(t *testing.T) {
 	fields := defaultFields()
 	fields.EncryptionAtHost = true
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	baseProfile := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile
 	require.NotNil(t, baseProfile.SecurityProfile)
@@ -211,12 +267,14 @@ func TestBuildFleetBody_EncryptionAtHostTrue(t *testing.T) {
 }
 
 // TestBuildFleetBody_EncryptionAtHostFalse verifies that when EncryptionAtHost is false,
-// the SecurityProfile is nil (not set), matching the VM path behaviour.
+// the SecurityProfile is nil (not set), matching the VM path behavior.
 func TestBuildFleetBody_EncryptionAtHostFalse(t *testing.T) {
 	fields := defaultFields()
 	fields.EncryptionAtHost = false
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	baseProfile := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile
 	assert.Nil(t, baseProfile.SecurityProfile)
@@ -229,7 +287,9 @@ func TestBuildFleetBody_NodeIdentitiesPopulated(t *testing.T) {
 	fields := defaultFields()
 	fields.NodeIdentities = "/sub/rg/identity1,/sub/rg/identity2"
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Identity)
 	assert.Equal(t, lo.ToPtr(armcomputefleet.ManagedServiceIdentityTypeUserAssigned), fleet.Identity.Type)
@@ -244,7 +304,9 @@ func TestBuildFleetBody_NodeIdentitiesEmpty(t *testing.T) {
 	fields := defaultFields()
 	fields.NodeIdentities = ""
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	assert.Nil(t, fleet.Identity)
 }
@@ -254,7 +316,9 @@ func TestBuildFleetBody_NodeIdentitiesEmpty(t *testing.T) {
 func TestBuildFleetBody_NetworkProfile_Basic(t *testing.T) {
 	fields := defaultFields()
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	np := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile
 	require.NotNil(t, np)
@@ -281,7 +345,9 @@ func TestBuildFleetBody_NetworkProfile_NoNSG(t *testing.T) {
 	fields := defaultFields()
 	fields.NSG = ""
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	nic := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations[0]
 	assert.Nil(t, nic.Properties.NetworkSecurityGroup)
@@ -293,7 +359,9 @@ func TestBuildFleetBody_NetworkProfile_LBPools(t *testing.T) {
 	fields := defaultFields()
 	pools := []string{"/sub/rg/lb/pool1", "/sub/rg/lb/pool2"}
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", pools, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", pools, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	ipConfig := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.
 		NetworkInterfaceConfigurations[0].Properties.IPConfigurations[0]
@@ -309,7 +377,9 @@ func TestBuildFleetBody_AcceleratedNetworking_AllSupport(t *testing.T) {
 	fields.CandidateSKUs = []string{"Standard_D4s_v3", "Standard_D8s_v3"}
 	its := mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3") // all support AN
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, its, true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, its, true, nil)
+
+	require.NoError(t, err)
 
 	nic := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations[0]
 	assert.Equal(t, lo.ToPtr(true), nic.Properties.EnableAcceleratedNetworking)
@@ -326,7 +396,9 @@ func TestBuildFleetBody_AcceleratedNetworking_OneMissing(t *testing.T) {
 		"Standard_A2_v2":  mkInstanceTypesNoAN("Standard_A2_v2")["Standard_A2_v2"],
 	}
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, its, true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, its, true, nil)
+
+	require.NoError(t, err)
 
 	nic := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.NetworkProfile.NetworkInterfaceConfigurations[0]
 	assert.Equal(t, lo.ToPtr(false), nic.Properties.EnableAcceleratedNetworking)
@@ -337,7 +409,9 @@ func TestBuildFleetBody_AcceleratedNetworking_OneMissing(t *testing.T) {
 func TestBuildFleetBody_ImageReference_SIG(t *testing.T) {
 	fields := defaultFields()
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	imgRef := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.ImageReference
 	require.NotNil(t, imgRef.ID)
@@ -350,7 +424,9 @@ func TestBuildFleetBody_ImageReference_SIG(t *testing.T) {
 func TestBuildFleetBody_ImageReference_CommunityGallery(t *testing.T) {
 	fields := defaultFields()
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), false, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), false, nil)
+
+	require.NoError(t, err)
 
 	imgRef := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.ImageReference
 	assert.Nil(t, imgRef.ID)
@@ -364,7 +440,9 @@ func TestBuildFleetBody_OSDisk_Ephemeral(t *testing.T) {
 	fields := defaultFields()
 	fields.OSDiskType = "CacheDisk"
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	osDisk := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.OSDisk
 	require.NotNil(t, osDisk.DiffDiskSettings)
@@ -379,7 +457,9 @@ func TestBuildFleetBody_OSDisk_Managed(t *testing.T) {
 	fields := defaultFields()
 	fields.OSDiskType = ""
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	osDisk := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.OSDisk
 	assert.Nil(t, osDisk.DiffDiskSettings)
@@ -392,16 +472,18 @@ func TestBuildFleetBody_OSDisk_EncryptionSet(t *testing.T) {
 	fields := defaultFields()
 	fields.DiskEncryptionSetID = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/diskEncryptionSets/des"
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	osDisk := fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.StorageProfile.OSDisk
 	require.NotNil(t, osDisk.ManagedDisk)
 	require.NotNil(t, osDisk.ManagedDisk.DiskEncryptionSet)
 	assert.Equal(t, fields.DiskEncryptionSetID, *osDisk.ManagedDisk.DiskEncryptionSet.ID)
-	// StorageAccountType must be set whenever ManagedDisk is — ARM defaults Standard_LRS
-	// but the canonical SDK example and reference templates set it explicitly. Be defensive.
-	require.NotNil(t, osDisk.ManagedDisk.StorageAccountType, "StorageAccountType must be set on ManagedDisk")
-	assert.Equal(t, armcomputefleet.StorageAccountTypesStandardLRS, *osDisk.ManagedDisk.StorageAccountType)
+	assert.Nil(t, osDisk.ManagedDisk.StorageAccountType)
+	data, err := json.Marshal(fleet)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), `"storageAccountType"`)
 }
 
 // TestBuildFleetBody_Capacity verifies that targetCapacity is correctly mapped to the
@@ -410,7 +492,9 @@ func TestBuildFleetBody_Capacity(t *testing.T) {
 	fields := defaultFields()
 	fields.CapacityType = "on-demand"
 
-	fleet := BuildFleetBody(fields, 7, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 7, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties.RegularPriorityProfile.Capacity)
 	assert.Equal(t, int32(7), *fleet.Properties.RegularPriorityProfile.Capacity)
@@ -424,7 +508,9 @@ func TestBuildFleetBody_LocationAndZones(t *testing.T) {
 	fields := defaultFields()
 	fields.Zones = []string{"westus2-1", "westus2-2", "westus2-3"}
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "westus2", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "westus2", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	assert.Equal(t, lo.ToPtr("westus2"), fleet.Location)
 	require.Len(t, fleet.Zones, 3)
@@ -440,7 +526,9 @@ func TestBuildFleetBody_RegionalZoneIsDropped(t *testing.T) {
 	fields := defaultFields()
 	fields.Zones = []string{"0"}
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "westus2", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "westus2", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	assert.Nil(t, fleet.Zones, "Regional ('0') zone should be dropped, resulting in a regional Fleet")
 }
@@ -453,7 +541,9 @@ func TestBuildFleetBody_UnknownCapacityType_DefaultsToRegular(t *testing.T) {
 	fields := defaultFields()
 	fields.CapacityType = "garbage-type"
 
-	fleet := BuildFleetBody(fields, 2, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 2, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties.RegularPriorityProfile)
 	assert.Nil(t, fleet.Properties.SpotPriorityProfile)
@@ -465,7 +555,9 @@ func TestBuildFleetBody_UnknownCapacityType_DefaultsToRegular(t *testing.T) {
 func TestBuildFleetBody_NoExtensions_NoExtensionProfile(t *testing.T) {
 	fields := defaultFields()
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	assert.Nil(t, fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.ExtensionProfile)
 }
@@ -475,7 +567,6 @@ func TestBuildFleetBody_NoExtensions_NoExtensionProfile(t *testing.T) {
 // This test validates the structural conversion; correctness of individual extension field
 // mapping is the responsibility of fleet-poc-mh-extensions-in-body's tests.
 func TestBuildFleetBody_WithExtensions_ConvertedAndAttached(t *testing.T) {
-
 	fields := defaultFields()
 	exts := []*armcompute.VirtualMachineExtension{
 		{
@@ -489,7 +580,9 @@ func TestBuildFleetBody_WithExtensions_ConvertedAndAttached(t *testing.T) {
 		},
 	}
 
-	fleet := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, exts)
+	fleet, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, exts)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.ExtensionProfile)
 	assert.Len(t, fleet.Properties.ComputeProfile.BaseVirtualMachineProfile.ExtensionProfile.Extensions, 1)
@@ -515,7 +608,9 @@ func TestBuildFleetBody_WithExtensions_PointerToMap(t *testing.T) {
 		},
 	}
 
-	f := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3"), false, exts)
+	f, err := BuildFleetBody(fields, 1, defaultTags(), nil, "eastus", nil, mkInstanceTypes("Standard_D4s_v3"), false, exts)
+
+	require.NoError(t, err)
 
 	require.NotNil(t, f.Properties.ComputeProfile.BaseVirtualMachineProfile.ExtensionProfile)
 	ext := f.Properties.ComputeProfile.BaseVirtualMachineProfile.ExtensionProfile.Extensions[0]
@@ -541,8 +636,10 @@ func TestBuildFleetBody_RoundTripMarshal(t *testing.T) {
 	price := float32(0.75)
 	pools := []string{"/sub/rg/lb/pool1"}
 
-	original := BuildFleetBody(fields, 5, defaultTags(), &price, "eastus2",
+	original, err := BuildFleetBody(fields, 5, defaultTags(), &price, "eastus2",
 		pools, mkInstanceTypes("Standard_D4s_v3", "Standard_D8s_v3"), true, nil)
+
+	require.NoError(t, err)
 
 	// Marshal → JSON
 	data, err := json.Marshal(original)

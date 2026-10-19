@@ -49,23 +49,24 @@ type VMAPI interface {
 
 // FleetVMProvisionRequest represents a single NodeClaim's request to provision a VM via the Fleet batcher.
 type FleetVMProvisionRequest struct {
-	NodeClaimName       string
-	CapacityType        string
-	AcceptableSKUs      []string
-	AcceptableZones     []string
-	Tags                map[string]*string
-	NodeClaim           *karpv1.NodeClaim
-	NodeClass           *v1beta1.AKSNodeClass
-	LaunchTemplate      *launchtemplate.Template
-	InstanceTypes       map[string]*cloudprovider.InstanceType
-	SSHPublicKey        string
-	AdminUsername       string
-	NodeIdentities      []string
-	DiskEncryptionSetID string
-	NSG                 string
-	LBBackendPools      []string
-	Location            string
-	Extensions          []*armcompute.VirtualMachineExtension
+	NodeClaimName        string
+	CapacityType         string
+	AcceptableSKUs       []string
+	AcceptableZones      []string
+	Tags                 map[string]*string
+	NodeClaim            *karpv1.NodeClaim
+	NodeClass            *v1beta1.AKSNodeClass
+	LaunchTemplate       *launchtemplate.Template
+	InstanceTypes        map[string]*cloudprovider.InstanceType
+	SSHPublicKey         string
+	AdminUsername        string
+	NodeIdentities       []string
+	DiskEncryptionSetID  string
+	NSG                  string
+	LBBackendPools       []string
+	IPConfigurationCount int32
+	Location             string
+	Extensions           []*armcompute.VirtualMachineExtension
 
 	// Interconnect topology fields, sourced from AKSNodeClass.Spec.InterconnectBlockID /
 	// InterconnectGroupID / InterconnectSubgroupID. Empty when unset. Applied to the Fleet

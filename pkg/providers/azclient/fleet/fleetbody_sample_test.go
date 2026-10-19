@@ -44,7 +44,8 @@ const sampleFleetBodyPath = "testdata/fleet_body_sample.json"
 // The input is deterministic (sorted slices, ordered maps via encoding/json sort) so the
 // output JSON is stable across runs.
 func TestBuildFleetBody_SampleJSON(t *testing.T) {
-	fleet := buildCanonicalFleetForSample()
+	fleet, err := buildCanonicalFleetForSample()
+	require.NoError(t, err)
 
 	got, err := json.MarshalIndent(fleet, "", "  ")
 	require.NoError(t, err, "marshal must succeed")
@@ -74,7 +75,7 @@ func TestBuildFleetBody_SampleJSON(t *testing.T) {
 // inputs. It exercises spot priority, encryption-at-host, ephemeral OS disk,
 // disk-encryption set, user-assigned identities, LB backend pools, and extensions —
 // the full surface area we care about catching drift on.
-func buildCanonicalFleetForSample() interface{} {
+func buildCanonicalFleetForSample() (interface{}, error) {
 	fields := defaultFields()
 	fields.CapacityType = "spot"
 	fields.OSDiskType = "CacheDisk"

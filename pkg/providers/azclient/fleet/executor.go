@@ -218,7 +218,7 @@ func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch
 	fleetTags[FleetNameTagKey] = lo.ToPtr(name)
 	fleetTags[ManagedByTagKey] = lo.ToPtr(ManagedByTagValue)
 
-	fleetBody := BuildFleetBody(
+	fleetBody, err := BuildFleetBody(
 		fields,
 		int32(len(batch.Requests)),
 		fleetTags,
@@ -229,6 +229,12 @@ func (e *executor) doSingleFleetCreate(ctx context.Context, batch *batcher.Batch
 		false, // useSIG: not used in POC
 		representative.Extensions,
 	)
+	if err != nil {
+		buildErr := fmt.Errorf("building fleet body: %w", err)
+		logger.Error(buildErr, "failed to build fleet body")
+		e.distributeError(batch, buildErr)
+		return 0, requested, buildErr
+	}
 
 	// 4. Call Fleet API BeginCreateOrUpdate.
 	logger.Info("submitting fleet create-or-update")

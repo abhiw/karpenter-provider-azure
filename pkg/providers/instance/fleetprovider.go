@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/fleet"
@@ -43,6 +44,13 @@ import (
 )
 
 const defaultMaxCandidateSKUs = 10
+
+func fleetIPConfigurationCount(nodeClass *v1beta1.AKSNodeClass, networkPlugin, networkPluginMode string) int32 {
+	if networkPlugin == consts.NetworkPluginAzure && networkPluginMode != consts.NetworkPluginModeOverlay {
+		return utils.GetMaxPods(nodeClass, networkPlugin, networkPluginMode)
+	}
+	return 1
+}
 
 // FleetProvider is the interface for fleet-based instance creation.
 type FleetProvider interface {
@@ -176,23 +184,24 @@ func (p *DefaultFleetProvider) BeginCreate(
 	extensions := buildFleetExtensions(launchTemplate, p.location, launchTemplate.Tags)
 
 	req := fleet.FleetVMProvisionRequest{
-		NodeClaimName:       nodeClaim.Name,
-		CapacityType:        capacityType,
-		AcceptableSKUs:      skuNames,
-		AcceptableZones:     zones,
-		Tags:                launchTemplate.Tags,
-		NodeClaim:           nodeClaim,
-		NodeClass:           nodeClass,
-		LaunchTemplate:      launchTemplate,
-		InstanceTypes:       itMap,
-		SSHPublicKey:        options.FromContext(ctx).SSHPublicKey,
-		AdminUsername:       options.FromContext(ctx).LinuxAdminUsername,
-		NodeIdentities:      options.FromContext(ctx).NodeIdentities,
-		DiskEncryptionSetID: p.diskEncryptionSetID,
-		NSG:                 nsgID,
-		LBBackendPools:      backendPools.IPv4PoolIDs,
-		Location:            p.location,
-		Extensions:          extensions,
+		NodeClaimName:          nodeClaim.Name,
+		CapacityType:           capacityType,
+		AcceptableSKUs:         skuNames,
+		AcceptableZones:        zones,
+		Tags:                   launchTemplate.Tags,
+		NodeClaim:              nodeClaim,
+		NodeClass:              nodeClass,
+		LaunchTemplate:         launchTemplate,
+		InstanceTypes:          itMap,
+		SSHPublicKey:           options.FromContext(ctx).SSHPublicKey,
+		AdminUsername:          options.FromContext(ctx).LinuxAdminUsername,
+		NodeIdentities:         options.FromContext(ctx).NodeIdentities,
+		DiskEncryptionSetID:    p.diskEncryptionSetID,
+		NSG:                    nsgID,
+		LBBackendPools:         backendPools.IPv4PoolIDs,
+		IPConfigurationCount:   fleetIPConfigurationCount(nodeClass, options.FromContext(ctx).NetworkPlugin, options.FromContext(ctx).NetworkPluginMode),
+		Location:               p.location,
+		Extensions:             extensions,
 		InterconnectBlockID:    lo.FromPtr(nodeClass.Spec.InterconnectBlockID),
 		InterconnectGroupID:    lo.FromPtr(nodeClass.Spec.InterconnectGroupID),
 		InterconnectSubgroupID: lo.FromPtr(nodeClass.Spec.InterconnectSubgroupID),

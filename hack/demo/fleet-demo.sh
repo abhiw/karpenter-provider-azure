@@ -3,10 +3,25 @@
 # Usage: ./hack/demo/fleet-demo.sh [step] [demo-suffix]
 #   Steps: setup | deploy | provision | interconnect | observe | cleanup | all (default: all)
 #   demo-suffix: optional suffix for the default resource group name.
+#   Secondary IP verification: secondary-setup | secondary-deploy |
+#     secondary-provision | secondary-verify | secondary-cleanup.
+#   Secondary steps default to the test subscription and awarhekar-karpenter-test RG.
+#   Cluster, registry and identity names also have awarhekar-prefixed defaults.
+#   Environment overrides take precedence. See fleet-secondary-ips.sh for settings.
 set -euo pipefail
 
 STEP="${1:-all}"
 ARG_DEMO_SUFFIX="${2:-}"
+if [[ "$STEP" == secondary-* ]]; then
+    export AZURE_SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:-2994199d-5716-49a3-80aa-eb2ff114e431}"
+    export AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-awarhekar-karpenter-test}"
+    export AZURE_CLUSTER_NAME="${AZURE_CLUSTER_NAME:-awarhekar-karpenter-test}"
+    export AZURE_ACR_NAME="${AZURE_ACR_NAME:-awarhekarfleetacr}"
+    export KARPENTER_MSI_NAME="${KARPENTER_MSI_NAME:-awarhekar-karpenter-msi}"
+    export KARPENTER_SA_NAME="${KARPENTER_SA_NAME:-awarhekar-karpenter-sa}"
+    # The POC logs complete Fleet requests at debug level, including bootstrap data.
+    export LOG_LEVEL="${LOG_LEVEL:-info}"
+fi
 
 ###############################################################################
 # Configuration
@@ -153,7 +168,13 @@ step_setup() {
     # AKS Cluster
     echo ""
     info "Creating AKS cluster '$AZURE_CLUSTER_NAME'..."
-    echo "  Config: 2 system nodes, azure-cni overlay, cilium dataplane, OIDC issuer enabled."
+    local network_args=(--network-plugin azure --network-plugin-mode overlay --network-dataplane cilium --network-policy cilium)
+    if [[ "$STEP" == secondary-* ]]; then
+        network_args=(--network-plugin azure --max-pods 30)
+        info "Using Azure CNI node-subnet networking, without Overlay or Cilium."
+    else
+        echo "  Config: azure-cni overlay, cilium dataplane, OIDC issuer enabled."
+    fi
     if ! az aks show --name "$AZURE_CLUSTER_NAME" --resource-group "$AZURE_RESOURCE_GROUP" &>/dev/null; then
         wait_msg "This takes 3-5 minutes..."
         az aks create \
@@ -163,10 +184,7 @@ step_setup() {
             --node-resource-group "$AZURE_NODE_RESOURCE_GROUP" \
             --node-count 1 \
             --node-vm-size Standard_D4ads_v5 \
-            --network-plugin azure \
-            --network-plugin-mode overlay \
-            --network-dataplane cilium \
-            --network-policy cilium \
+            "${network_args[@]}" \
             --enable-oidc-issuer \
             --enable-workload-identity \
             --generate-ssh-keys \
@@ -187,7 +205,9 @@ step_setup() {
     # user's explicit request as a best-effort/speculative raw ARM PATCH — it is
     # expected to be silently ignored or rejected by the API and is NOT required by
     # the Fleet interconnect feature itself (see spec-design-fleet-interconnect-vmsize-params.md §12).
-    apply_zone_placement_policy_any
+    if [[ "$STEP" != secondary-* ]]; then
+        apply_zone_placement_policy_any
+    fi
 
     # Get credentials
     echo ""
@@ -978,6 +998,11 @@ step_cleanup() {
 # Main
 ###############################################################################
 case "$STEP" in
+    secondary-*)
+        # shellcheck source=hack/demo/fleet-secondary-ips.sh
+        source "$SCRIPT_DIR/fleet-secondary-ips.sh"
+        secondary_main "$STEP"
+        ;;
     setup)        step_setup ;;
     deploy)       step_deploy ;;
     provision)    step_provision ;;
@@ -1002,6 +1027,15 @@ case "$STEP" in
         echo "  observe      Query Fleet resources, save request bodies, show VM details"
         echo "  cleanup      Remove workload and nodes"
         echo "  all          Run setup → deploy → provision → observe (no cleanup)"
+        echo "  secondary-{setup,deploy,provision,verify,cleanup}"
+        echo "               Isolated Azure CNI node-subnet secondary-IP verification."
+        echo "               Default subscription: 2994199d-5716-49a3-80aa-eb2ff114e431"
+        echo "               Default resource group: awarhekar-karpenter-test (env overrides supported)"
+        echo "               Default cluster: awarhekar-karpenter-test; registry: awarhekarfleetacr"
+        echo "               Default identity: awarhekar-karpenter-msi; service account: awarhekar-karpenter-sa"
+        echo "               Optionally SECONDARY_NODES=1"
+        echo "               for a smoke test (default 2), SECONDARY_MAX_PODS=30,"
+        echo "               SECONDARY_VM_SIZE=Standard_D4ads_v5."
         echo ""
         echo "Demo suffix:"
         echo "  Optional second argument used for the default resource group name:"

@@ -17,6 +17,7 @@ limitations under the License.
 package fleet
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -57,7 +58,11 @@ func BuildFleetBody(
 	instanceTypes map[string]*corecloudprovider.InstanceType,
 	useSIG bool,
 	extensions []*armcompute.VirtualMachineExtension,
-) *armcomputefleet.Fleet {
+) (*armcomputefleet.Fleet, error) {
+	// AKSNodeClass caps MaxPods at 250; other network modes require one config.
+	if fields.IPConfigurationCount < 1 || fields.IPConfigurationCount > 250 {
+		return nil, fmt.Errorf("IP configuration count must be between 1 and 250, got %d", fields.IPConfigurationCount)
+	}
 
 	fleet := &armcomputefleet.Fleet{
 		Location:   lo.ToPtr(location),
@@ -67,7 +72,7 @@ func BuildFleetBody(
 		Properties: buildFleetProperties(fields, targetCapacity, spotMaxPrice, lbBackendPools, instanceTypes, useSIG, extensions),
 	}
 
-	return fleet
+	return fleet, nil
 }
 
 // buildZones converts AKS-label zone strings (e.g. "southcentralus-1" or Regional "0")
@@ -160,7 +165,7 @@ func buildVMSizesProfile(skus []string) []*armcomputefleet.VMSizeProfile {
 // maintain=false is non-negotiable — Karpenter manages eviction/replacement, not Fleet.
 func buildSpotProfile(capacity int32, maxPrice *float32) *armcomputefleet.SpotPriorityProfile {
 	if maxPrice == nil {
-		// Default to -1: willing to pay up to on-demand price, matching VM-path behaviour.
+		// Default to -1: willing to pay up to on-demand price, matching VM-path behavior.
 		maxPrice = lo.ToPtr(float32(-1))
 	}
 	return &armcomputefleet.SpotPriorityProfile{
@@ -194,7 +199,7 @@ func buildComputeProfile(
 	baseProfile := &armcomputefleet.BaseVirtualMachineProfile{
 		OSProfile:        buildOSProfile(fields),
 		StorageProfile:   buildStorageProfile(fields, useSIG),
-		NetworkProfile:   buildNetworkProfile(fields.SubnetID, fields.NSG, lbBackendPools, enableAN),
+		NetworkProfile:   buildNetworkProfile(fields.SubnetID, fields.NSG, lbBackendPools, enableAN, fields.IPConfigurationCount),
 		SecurityProfile:  buildSecurityProfile(fields.EncryptionAtHost),
 		ExtensionProfile: extensionsToProfile(extensions),
 	}
@@ -257,10 +262,6 @@ func buildStorageProfile(fields BatchKeyFields, useSIG bool) *armcomputefleet.Vi
 	// Disk encryption set
 	if fields.DiskEncryptionSetID != "" {
 		osDisk.ManagedDisk = &armcomputefleet.VirtualMachineScaleSetManagedDiskParameters{
-			// StorageAccountType is required by ARM whenever ManagedDisk is set.
-			// ARM technically defaults to Standard_LRS, but the canonical SDK example
-			// and the AzureFleet reference templates set it explicitly. Be defensive.
-			StorageAccountType: lo.ToPtr(armcomputefleet.StorageAccountTypesStandardLRS),
 			DiskEncryptionSet: &armcomputefleet.DiskEncryptionSetParameters{
 				ID: lo.ToPtr(fields.DiskEncryptionSetID),
 			},
@@ -275,23 +276,28 @@ func buildStorageProfile(fields BatchKeyFields, useSIG bool) *armcomputefleet.Vi
 
 // buildNetworkProfile constructs the VMSS network profile with subnet, NSG, accelerated
 // networking, and LB backend pools.
-//
-// TODO(fleet-poc-mh-secondary-ips): Secondary IP configurations for AzureCNI-without-overlay
-// are deferred. POC assumes overlay or non-Azure-CNI networking.
-func buildNetworkProfile(subnetID, nsgID string, lbBackendPools []string, enableAcceleratedNetworking bool) *armcomputefleet.VirtualMachineScaleSetNetworkProfile {
+// ipConfigurationCount is validated by BuildFleetBody before constructing profiles.
+func buildNetworkProfile(subnetID, nsgID string, lbBackendPools []string, enableAcceleratedNetworking bool, ipConfigurationCount int32) *armcomputefleet.VirtualMachineScaleSetNetworkProfile {
+	ipConfigs := make([]*armcomputefleet.VirtualMachineScaleSetIPConfiguration, 0, ipConfigurationCount)
+	for i := int32(0); i < ipConfigurationCount; i++ {
+		props := &armcomputefleet.VirtualMachineScaleSetIPConfigurationProperties{
+			Primary: lo.ToPtr(i == 0),
+			Subnet:  &armcomputefleet.APIEntityReference{ID: lo.ToPtr(subnetID)},
+		}
+		if i == 0 {
+			props.LoadBalancerBackendAddressPools = buildPoolRefs(lbBackendPools)
+		}
+		ipConfigs = append(ipConfigs, &armcomputefleet.VirtualMachineScaleSetIPConfiguration{
+			Name:       lo.ToPtr(fmt.Sprintf("ipconfig%d", i+1)),
+			Properties: props,
+		})
+	}
 	nicProps := &armcomputefleet.VirtualMachineScaleSetNetworkConfigurationProperties{
 		Primary:                     lo.ToPtr(true),
 		EnableAcceleratedNetworking: lo.ToPtr(enableAcceleratedNetworking),
 		EnableIPForwarding:          lo.ToPtr(false),
 		DeleteOption:                lo.ToPtr(armcomputefleet.DeleteOptionsDelete),
-		IPConfigurations: []*armcomputefleet.VirtualMachineScaleSetIPConfiguration{{
-			Name: lo.ToPtr("ipconfig1"),
-			Properties: &armcomputefleet.VirtualMachineScaleSetIPConfigurationProperties{
-				Primary: lo.ToPtr(true),
-				Subnet:  &armcomputefleet.APIEntityReference{ID: lo.ToPtr(subnetID)},
-				LoadBalancerBackendAddressPools: buildPoolRefs(lbBackendPools),
-			},
-		}},
+		IPConfigurations:            ipConfigs,
 	}
 	if nsgID != "" {
 		nicProps.NetworkSecurityGroup = &armcomputefleet.SubResource{ID: lo.ToPtr(nsgID)}
