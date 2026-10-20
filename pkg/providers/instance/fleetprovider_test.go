@@ -24,6 +24,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -33,6 +34,19 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/allocationstrategy"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 )
+
+func TestFleetAdditionalLabels_MarksNodeUnmanagedForCCM(t *testing.T) {
+	g := NewWithT(t)
+	nodeClaim := &karpv1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{karpv1.CapacityTypeLabelKey: karpv1.CapacityTypeOnDemand}},
+	}
+	it := &cloudprovider.InstanceType{Name: "Standard_D2s_v5", Requirements: scheduling.NewRequirements()}
+
+	got := fleetAdditionalLabels(nodeClaim, it)
+
+	g.Expect(got).To(HaveKeyWithValue("kubernetes.azure.com/managed", "false"))
+	g.Expect(got).To(HaveKeyWithValue(karpv1.CapacityTypeLabelKey, karpv1.CapacityTypeOnDemand))
+}
 
 func TestBuildFleetExtensions_OnlyBootstrapExtensions(t *testing.T) {
 	for _, script := range []string{"", "echo bootstrap"} {

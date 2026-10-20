@@ -107,7 +107,7 @@ func vmWithFailedStateAndInstanceView(errorCode, errorMsg string) *armcompute.Vi
 
 func TestDefaultOptions_ErrorWindows(t *testing.T) {
 	opts := DefaultOptions()
-	assert.Equal(t, 20*time.Second, opts.NotFoundTimeout)
+	assert.Equal(t, 60*time.Second, opts.NotFoundTimeout)
 	assert.Equal(t, 2*time.Minute, opts.ErrorTimeout)
 	assert.Equal(t, 15*time.Minute, opts.MaxDuration)
 }

@@ -64,7 +64,7 @@ type Options struct {
 // DefaultOptions returns production poller configuration (same as aksmachinepoller).
 func DefaultOptions() Options {
 	return Options{
-		NotFoundTimeout: 20 * time.Second,
+		NotFoundTimeout: 60 * time.Second,
 		ErrorTimeout:    2 * time.Minute,
 		PollInterval:    5 * time.Second,
 		MaxDuration:     15 * time.Minute,
@@ -105,7 +105,7 @@ type Poller struct {
 // NewPoller creates a poller for a specific Fleet VM.
 func NewPoller(config Options, client VMGetter, resourceGroup, vmName string) *Poller {
 	if config.NotFoundTimeout <= 0 {
-		config.NotFoundTimeout = 20 * time.Second
+		config.NotFoundTimeout = 60 * time.Second
 	}
 	if config.ErrorTimeout <= 0 {
 		config.ErrorTimeout = 2 * time.Minute

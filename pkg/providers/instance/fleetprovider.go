@@ -45,6 +45,9 @@ import (
 
 const defaultMaxCandidateSKUs = 10
 
+// fleetCCMManagedLabelKey is the node label cloud-provider-azure uses to skip unmanaged nodes.
+const fleetCCMManagedLabelKey = "kubernetes.azure.com/managed"
+
 func fleetIPConfigurationCount(nodeClass *v1beta1.AKSNodeClass, networkPlugin, networkPluginMode string) int32 {
 	if networkPlugin == consts.NetworkPluginAzure && networkPluginMode != consts.NetworkPluginModeOverlay {
 		return utils.GetMaxPods(nodeClass, networkPlugin, networkPluginMode)
@@ -155,16 +158,7 @@ func (p *DefaultFleetProvider) BeginCreate(
 
 	// 5. Resolve launch template using representative type.
 	capacityType := nodeClaim.Labels[karpv1.CapacityTypeLabelKey]
-	claimLabels := labels.GetAllSingleValuedRequirementLabels(
-		scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...),
-	)
-	additionalLabels := lo.Assign(
-		claimLabels,
-		labels.GetAllSingleValuedRequirementLabels(representativeType.Requirements),
-		map[string]string{
-			karpv1.CapacityTypeLabelKey: capacityType,
-		},
-	)
+	additionalLabels := fleetAdditionalLabels(nodeClaim, representativeType)
 	launchTemplate, err := p.launchTemplateProvider.GetTemplate(ctx, nodeClass, nodeClaim, representativeType, additionalLabels)
 	if err != nil {
 		return nil, fmt.Errorf("getting launch template: %w", err)
@@ -250,6 +244,23 @@ func (p *DefaultFleetProvider) resolveNSG(ctx context.Context, subnetID string) 
 		return ""
 	}
 	return lo.FromPtr(nsg.ID)
+}
+
+// fleetAdditionalLabels returns the kubelet labels for a Fleet member node.
+// Fleet VM names (aks_xxx_N) differ from their node names (computerName), so the
+// cloud-controller-manager cannot resolve them and deletes NotReady fleet nodes.
+// Marking them unmanaged makes CCM treat the instance as existing.
+func fleetAdditionalLabels(nodeClaim *karpv1.NodeClaim, representativeType *cloudprovider.InstanceType) map[string]string {
+	return lo.Assign(
+		labels.GetAllSingleValuedRequirementLabels(
+			scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...),
+		),
+		labels.GetAllSingleValuedRequirementLabels(representativeType.Requirements),
+		map[string]string{
+			karpv1.CapacityTypeLabelKey: nodeClaim.Labels[karpv1.CapacityTypeLabelKey],
+			fleetCCMManagedLabelKey:     "false",
+		},
+	)
 }
 
 // extractCandidateInfo extracts SKU names, the sorted union of zones across all offerings,
